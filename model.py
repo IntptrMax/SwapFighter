@@ -4,12 +4,16 @@ import torch
 import torch.nn as nn
 import timm
 import numpy as np
+import torch.nn.functional as F
 
+
+# ---------- Backbone ----------
 class Backbone(nn.Module):
     def __init__(self, name='convnextv2_tiny', pretrained=True):
         super().__init__()
         self.name = name
-        if 'vit' in name.lower():
+        is_vit = any(x in name.lower() for x in ['vit', 'dinov2'])
+        if is_vit:
             self.backbone = timm.create_model(
                 name,
                 pretrained=pretrained,
@@ -25,26 +29,20 @@ class Backbone(nn.Module):
                 num_classes=0
             )
         self.feature_info = self.backbone.feature_info
-        
-        # 获取所有特征图的通道数和步长
         all_channels = self.feature_info.channels()
         all_strides = [info['reduction'] for info in self.feature_info]
-        
+
         print(f"Backbone: {name}")
         print(f"所有特征图通道数: {all_channels}")
         print(f"所有特征图步长: {all_strides}")
-        
-        # 判断是否为 ViT（步长都相同）
+
         if len(set(all_strides)) == 1:
-            # ViT 等模型：所有特征图尺寸相同
             self.feature_indices = list(range(len(all_channels)))[-3:]
             self.out_channels = all_channels[-3:]
             self.strides = all_strides[-3:]
             self.is_vit = True
-            print("检测到 ViT 风格模型，使用简化 FPN")
-        # 对于 Swin Transformer，需要特殊处理
+            print("检测到 ViT 风格模型")
         elif 'swin' in name.lower():
-            # Swin Transformer 返回 4 个特征图，选择步长为 8, 16, 32 的
             self.feature_indices = []
             self.out_channels = []
             self.strides = []
@@ -53,203 +51,345 @@ class Backbone(nn.Module):
                     self.feature_indices.append(idx)
                     self.out_channels.append(all_channels[idx])
                     self.strides.append(stride)
-            
-            # 如果没找到合适的步长，使用索引 1, 2, 3
             if len(self.feature_indices) < 3:
                 self.feature_indices = [1, 2, 3]
                 self.out_channels = all_channels[1:4]
                 self.strides = all_strides[1:4]
             self.is_vit = False
         else:
-            # 其他模型：取最后3个特征图
             self.out_channels = all_channels[-3:]
             self.strides = all_strides[-3:]
             self.feature_indices = list(range(len(all_channels)))[-3:]
             self.is_vit = False
-        
+
         print(f"选择的特征图索引: {self.feature_indices}")
         print(f"选择的通道数: {self.out_channels}")
         print(f"选择的步长: {self.strides}")
-        
-        # 标记是否为 Swin（需要格式转换）
+
         self.need_permute = 'swin' in name.lower()
         print(f"需要格式转换 (NHWC->NCHW): {self.need_permute}")
 
     def forward(self, x):
         features = self.backbone(x)
-        
-        # 根据索引取特征图
         selected_features = [features[i] for i in self.feature_indices]
-        
-        # 只有 Swin Transformer 需要转换格式（NHWC -> NCHW）
         if self.need_permute:
             converted_features = []
             for feat in selected_features:
-                # Swin 输出格式为 [B, H, W, C]，转换为 [B, C, H, W]
                 if len(feat.shape) == 4:
                     feat = feat.permute(0, 3, 1, 2)
                 converted_features.append(feat)
             selected_features = converted_features
-        
-        # 打印调试信息（仅在第一次迭代）
-        if not hasattr(self, '_debug_printed'):
-            print("\n特征图形状（调试信息）:")
-            for idx, feat in enumerate(selected_features):
-                print(f"  特征图 {idx}: 形状 {feat.shape}")
-            self._debug_printed = True
-        
+
         return selected_features
 
 
-class FPN(nn.Module):
-    def __init__(self, in_channels_list, out_channels=256, is_vit=False):
+# ---------- BiFPN 核心模块（模型太重，暂时抛弃） ----------
+class BiFPNLayer(nn.Module):
+    def __init__(self, channels, num_levels=3, epsilon=1e-4):
         super().__init__()
-        self.is_vit = is_vit
-        self.lateral_convs = nn.ModuleList()
-        self.fpn_convs = nn.ModuleList()
-        
-        for in_ch in in_channels_list:
-            self.lateral_convs.append(nn.Conv2d(in_ch, out_channels, 1))
-            self.fpn_convs.append(nn.Conv2d(out_channels, out_channels, 3, padding=1))
-        
-        if is_vit:
-            # ViT 模式：所有特征图尺寸相同
-            self.upsample = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
-        else:
-            self.upsample = nn.Upsample(scale_factor=2, mode='nearest')
+        self.num_levels = num_levels
+        self.epsilon = epsilon
+
+        self.td_weights = nn.ParameterList()
+        for _ in range(num_levels - 1):
+            self.td_weights.append(nn.Parameter(torch.ones(2, dtype=torch.float32)))
+
+        self.bu_weights = nn.ParameterList()
+        for _ in range(1, num_levels):
+            self.bu_weights.append(nn.Parameter(torch.ones(2, dtype=torch.float32)))
+
+        self.td_convs = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(channels, channels, 3, padding=1),
+                nn.BatchNorm2d(channels),
+                nn.ReLU(inplace=True)
+            ) for _ in range(num_levels - 1)
+        ])
+        self.bu_convs = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(channels, channels, 3, padding=1),
+                nn.BatchNorm2d(channels),
+                nn.ReLU(inplace=True)
+            ) for _ in range(num_levels - 1)
+        ])
+
+    def forward(self, inputs):
+        td_outputs = [None] * self.num_levels
+        td_outputs[-1] = inputs[-1]
+
+        for i in range(self.num_levels - 2, -1, -1):
+            cur = inputs[i]
+            up = nn.functional.interpolate(
+                td_outputs[i + 1], size=cur.shape[2:], mode='nearest'
+            )
+            weights = self.td_weights[i]
+            norm_weights = torch.softmax(weights, dim=0)
+            fused = (norm_weights[0] * cur + norm_weights[1] * up) / (norm_weights.sum() + self.epsilon)
+            td_outputs[i] = self.td_convs[i](fused)
+
+        bu_outputs = [None] * self.num_levels
+        bu_outputs[0] = td_outputs[0]
+
+        for i in range(1, self.num_levels):
+            cur = td_outputs[i]
+            down = nn.functional.interpolate(
+                bu_outputs[i - 1], size=cur.shape[2:], mode='nearest'
+            )
+            weights = self.bu_weights[i - 1]
+            norm_weights = torch.softmax(weights, dim=0)
+            fused = (norm_weights[0] * cur + norm_weights[1] * down) / (norm_weights.sum() + self.epsilon)
+            bu_outputs[i] = self.bu_convs[i - 1](fused)
+
+        return bu_outputs
+
+
+class BiFPN(nn.Module):
+    def __init__(self, in_channels_list, out_channels=256, num_layers=2):
+        super().__init__()
+        self.num_levels = len(in_channels_list)
+        self.out_channels = out_channels
+        self.num_layers = num_layers
+
+        self.lateral_convs = nn.ModuleList([
+            nn.Conv2d(ch, out_channels, 1) for ch in in_channels_list
+        ])
+
+        self.bifpn_layers = nn.ModuleList([
+            BiFPNLayer(out_channels, self.num_levels) for _ in range(num_layers)
+        ])
+
+        self.output_convs = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(out_channels, out_channels, 3, padding=1),
+                nn.BatchNorm2d(out_channels),
+                nn.ReLU(inplace=True)
+            ) for _ in range(self.num_levels)
+        ])
 
     def forward(self, features):
-        laterals = [lateral_conv(f) for lateral_conv, f in zip(self.lateral_convs, features)]
-        
-        if self.is_vit:
-            # ViT 模式：所有特征图尺寸相同，不需要金字塔融合
-            fpn_features = laterals
-        else:
-            # 标准 FPN 融合
-            fpn_features = []
-            for i in range(len(laterals) - 1, -1, -1):
-                if i == len(laterals) - 1:
-                    fpn_features.append(laterals[i])
-                else:
-                    up = self.upsample(fpn_features[-1])
-                    # 尺寸匹配检查
-                    if up.shape[2:] != laterals[i].shape[2:]:
-                        up = nn.functional.interpolate(
-                            up, size=laterals[i].shape[2:], mode='nearest'
-                        )
-                    fpn_features.append(laterals[i] + up)
-            fpn_features = fpn_features[::-1]
-        
-        # 应用 FPN 卷积
-        out = [self.fpn_convs[i](fpn_features[i]) for i in range(len(fpn_features))]
-        return out
+        laterals = [conv(f) for conv, f in zip(self.lateral_convs, features)]
+        outputs = laterals
+        for layer in self.bifpn_layers:
+            outputs = layer(outputs)
+        outputs = [conv(out) for conv, out in zip(self.output_convs, outputs)]
+        return outputs
 
 
-class FCOSHead(nn.Module):
-    def __init__(self, in_channels, num_classes):
+# ---------- 轻量级 FPN ----------
+class LightFPN(nn.Module):
+    def __init__(self, in_channels_list, out_channels=128, use_extra_conv=True):
         super().__init__()
-        self.num_classes = num_classes
-        self.cls_tower = nn.Sequential(
-            nn.Conv2d(in_channels, in_channels, 3, padding=1),
-            nn.GroupNorm(32, in_channels),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(in_channels, in_channels, 3, padding=1),
-            nn.GroupNorm(32, in_channels),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(in_channels, in_channels, 3, padding=1),
-            nn.GroupNorm(32, in_channels),
-            nn.ReLU(inplace=True),
-        )
-        self.cls_logits = nn.Conv2d(in_channels, num_classes, 3, padding=1)
+        self.lateral_convs = nn.ModuleList([
+            nn.Conv2d(ch, out_channels, 1) for ch in in_channels_list
+        ])
+        self.use_extra_conv = use_extra_conv
+        if use_extra_conv:
+            self.extra_convs = nn.ModuleList([
+                nn.Sequential(
+                    nn.Conv2d(out_channels, out_channels, 3, padding=1),
+                    nn.BatchNorm2d(out_channels),
+                    nn.ReLU(inplace=True)
+                ) for _ in range(len(in_channels_list))
+            ])
 
-        self.reg_tower = nn.Sequential(
-            nn.Conv2d(in_channels, in_channels, 3, padding=1),
-            nn.GroupNorm(32, in_channels),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(in_channels, in_channels, 3, padding=1),
-            nn.GroupNorm(32, in_channels),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(in_channels, in_channels, 3, padding=1),
-            nn.GroupNorm(32, in_channels),
-            nn.ReLU(inplace=True),
-        )
-        self.reg_pred = nn.Conv2d(in_channels, 4, 3, padding=1)
+    def forward(self, features):
+        laterals = [conv(f) for conv, f in zip(self.lateral_convs, features)]
+        outputs = [laterals[-1]]
+        for i in range(len(laterals) - 2, -1, -1):
+            up = F.interpolate(outputs[0], size=laterals[i].shape[2:], mode='nearest')
+            fused = laterals[i] + up
+            if self.use_extra_conv:
+                fused = self.extra_convs[i](fused)
+            outputs.insert(0, fused)
+        return outputs
+
+
+# ---------- 解耦检测头 ----------
+class TaskHead(nn.Module):
+    """
+    单个任务的检测头，包含一个卷积塔和输出层。
+    支持任务类型标记，便于特殊初始化。
+    """
+    def __init__(self, in_channels, out_channels, task_type, num_convs=3, norm_layer=nn.GroupNorm):
+        super().__init__()
+        self.task_type = task_type          # 'cls', 'reg', 'angle', etc.
+        self.out_channels = out_channels
+
+        layers = []
+        for i in range(num_convs):
+            conv = nn.Conv2d(in_channels, in_channels, 3, padding=1)
+            # 使用 kaiming_normal 初始化卷积
+            nn.init.kaiming_normal_(conv.weight, mode='fan_out', nonlinearity='relu')
+            nn.init.constant_(conv.bias, 0)
+            layers.append(conv)
+
+            norm = norm_layer(32, in_channels) if norm_layer == nn.GroupNorm else norm_layer(in_channels)
+            nn.init.constant_(norm.weight, 1)
+            nn.init.constant_(norm.bias, 0)
+            layers.append(norm)
+            layers.append(nn.ReLU(inplace=True))
+
+        self.tower = nn.Sequential(*layers)
+
+        # 预测层，先做默认初始化，稍后在 MultiTaskHead 中覆盖特殊初始化
+        self.pred = nn.Conv2d(in_channels, out_channels, 3, padding=1)
+        nn.init.kaiming_normal_(self.pred.weight, mode='fan_out', nonlinearity='relu')
+        nn.init.constant_(self.pred.bias, 0)
+        self.pred.is_pred_layer = True   # 标记，用于特殊初始化
 
     def forward(self, x):
-        cls_feat = self.cls_tower(x)
-        cls_logits = self.cls_logits(cls_feat)
-
-        reg_feat = self.reg_tower(x)
-        reg_pred = self.reg_pred(reg_feat)
-
-        return cls_logits, reg_pred
+        feat = self.tower(x)
+        return self.pred(feat)
 
 
-class DetectFCOS(nn.Module):
-    def __init__(self, num_classes, backbone_name='convnextv2_tiny', pretrained=True):
+class MultiTaskHead(nn.Module):
+    """
+    多任务检测头，支持分类、回归、角度等任务。
+    提供 init_weights() 方法对每个任务的预测层进行特殊初始化。
+    """
+    def __init__(self, in_channels, num_classes, tasks, angle_format='sin_cos', num_convs=3):
         super().__init__()
+        self.tasks = tasks
+        self.angle_format = angle_format
+        self.heads = nn.ModuleDict()
+        for task_name, out_channels in tasks.items():
+            self.heads[task_name] = TaskHead(
+                in_channels, out_channels, task_name, num_convs=num_convs
+            )
+
+    def init_weights(self, is_obb=False):
+        """
+        对每个任务头的预测层进行特殊初始化。
+
+        修复说明（detect 训练异常问题）：
+            reg 头的 bias 初始化必须区分模式：
+              - OBB 模式：输出 [dx, dy, dw, dh]，dw/dh 初始化为 -1，
+                对应初始框 w=h=exp(-1)*stride≈0.37*stride，利于小目标收敛。
+              - detect / segment 模式：输出 [l, t, r, b]。
+                * 全部为 0 会导致初始框宽高为 0，generalized_box_iou_loss
+                  无法提供有效梯度，训练一开始就崩。
+                * 因此这里填 16.0，使初始框具有约 32 像素的宽高，保证
+                  回归损失从第一步开始就有有意义的梯度。
+
+        角度头初始化：
+            - sin_cos 模式：bias 初始化为 [0, 1]，对应角度 0，单位向量稳定。
+            - direct 模式：bias 保持 0。
+
+        Args:
+            is_obb: 是否为 OBB 模式（由 DetectFCOS._init_weights 传入 self.with_angle）
+        """
+        for task_name, head in self.heads.items():
+            if hasattr(head.pred, 'is_pred_layer'):
+                m = head.pred
+                if task_name == 'cls':
+                    nn.init.normal_(m.weight, std=0.01)
+                    if m.bias is not None:
+                        prior_prob = 0.01
+                        nn.init.constant_(m.bias, -np.log((1 - prior_prob) / prior_prob))
+                elif task_name == 'reg':
+                    nn.init.normal_(m.weight, std=0.01)
+                    if m.bias is not None:
+                        with torch.no_grad():
+                            m.bias.zero_()
+                            if is_obb and m.bias.numel() >= 4:
+                                # OBB: [dx, dy, dw, dh] -> dw/dh = -1
+                                m.bias[2:4].fill_(-1.0)
+                            elif (not is_obb) and m.bias.numel() >= 4:
+                                # detect: [l, t, r, b] -> 初始距离设为 16 像素
+                                m.bias.fill_(16.0)
+                elif task_name == 'angle':
+                    nn.init.normal_(m.weight, std=0.005)
+                    if m.bias is not None:
+                        with torch.no_grad():
+                            m.bias.zero_()
+                            if self.angle_format == 'sin_cos' and m.bias.numel() >= 2:
+                                m.bias[0] = 0.0   # sin
+                                m.bias[1] = 1.0   # cos
+                            # direct 模式保持 0
+                else:
+                    # 其他任务采用默认初始化（已由 TaskHead 完成）
+                    pass
+
+    def forward(self, x):
+        return {name: head(x) for name, head in self.heads.items()}
+
+
+# ---------- 主检测网络 ----------
+class DetectFCOS(nn.Module):
+    def __init__(self, num_classes, backbone_name='convnextv2_tiny', pretrained=True,
+                 with_angle=False, angle_format='sin_cos', neck_out_channels=128,
+                 head_num_convs=2, use_extra_conv=True):
+        super().__init__()
+        self.with_angle = with_angle
+        self.angle_format = angle_format
         self.backbone = Backbone(backbone_name, pretrained)
         in_channels_list = self.backbone.out_channels
-        self.is_vit = self.backbone.is_vit
-        self.fpn = FPN(in_channels_list, out_channels=256, is_vit=self.is_vit)
-        self.head = FCOSHead(in_channels=256, num_classes=num_classes)
-        self.strides = self.backbone.strides
-        
-        # 是否冻结 Backbone（由外部控制）
-        self.is_backbone_frozen = False
 
+        # 使用 LightFPN
+        self.neck = LightFPN(in_channels_list, out_channels=neck_out_channels,
+                             use_extra_conv=use_extra_conv)
+
+        tasks = {'cls': num_classes, 'reg': 4}
+        if with_angle:
+            tasks['angle'] = 2 if angle_format == 'sin_cos' else 1
+
+        self.head = MultiTaskHead(neck_out_channels, num_classes, tasks,
+                                  angle_format, num_convs=head_num_convs)
+        self.strides = self.backbone.strides
+        self.is_backbone_frozen = False
         self._init_weights()
 
     def _init_weights(self):
-        import numpy as np
-        for module in [self.fpn, self.head]:
-            for m in module.modules():
-                if isinstance(m, nn.Conv2d):
-                    # 判断是否为输出层
-                    if hasattr(module, 'cls_logits') and m is module.cls_logits:
-                        nn.init.normal_(m.weight, std=0.01)
-                        if m.bias is not None:
-                            prior_prob = 0.01
-                            nn.init.constant_(m.bias, -np.log((1 - prior_prob) / prior_prob))
-                    elif hasattr(module, 'reg_pred') and m is module.reg_pred:
-                        nn.init.normal_(m.weight, std=0.01)
-                        if m.bias is not None:
-                            nn.init.constant_(m.bias, 0)
-                    else:
-                        nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-                        if m.bias is not None:
-                            nn.init.constant_(m.bias, 0)
-                elif isinstance(m, (nn.BatchNorm2d, nn.GroupNorm)):
-                    nn.init.constant_(m.weight, 1)
+        """初始化 Neck 和 Head（Head 内部会特殊初始化预测层）"""
+        # 1. 初始化 Neck 中的所有卷积和 BN
+        def init_neck(m):
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
+            elif isinstance(m, (nn.BatchNorm2d, nn.GroupNorm)):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+        self.neck.apply(init_neck)
+
+        # 2. 初始化 Head
+        #    关键：把 with_angle 作为 is_obb 传入，
+        #    确保只有 OBB 模式才用 dw/dh = -1 的回归头初始化；
+        #    detect 模式 reg 头 bias 用 16.0，避免初始框面积为零。
+        self.head.init_weights(is_obb=self.with_angle)
 
     def set_freeze_backbone(self, freeze=True):
-        """冻结或解冻 Backbone 参数"""
         self.is_backbone_frozen = freeze
         for param in self.backbone.parameters():
             param.requires_grad = not freeze
-        
-        # 统计参数数量
         if freeze:
             trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
             total_params = sum(p.numel() for p in self.parameters())
             print(f"Backbone 已冻结")
             print(f"  可训练参数: {trainable_params:,}")
             print(f"  总参数: {total_params:,}")
-            print(f"  冻结比例: {(1 - trainable_params/total_params) * 100:.1f}%")
+            print(f"  冻结比例: {(1 - trainable_params / total_params) * 100:.1f}%")
         else:
             print("Backbone 已解冻")
 
     def get_freeze_status(self):
-        """获取当前冻结状态"""
         return self.is_backbone_frozen
 
     def forward(self, x):
         features = self.backbone(x)
-        fpn_feats = self.fpn(features)
-        cls_logits_list, reg_preds_list = [], []
-        for feat in fpn_feats:
-            cls_logits, reg_pred = self.head(feat)
-            cls_logits_list.append(cls_logits)
-            reg_preds_list.append(reg_pred)
-        return cls_logits_list, reg_preds_list
+        neck_out = self.neck(features)
+
+        cls_logits_list = []
+        reg_preds_list = []
+        angle_preds_list = []
+        for feat in neck_out:
+            preds = self.head(feat)
+            cls_logits_list.append(preds['cls'])
+            reg_preds_list.append(preds['reg'])
+            if self.with_angle:
+                angle_preds_list.append(preds['angle'])
+
+        if self.with_angle:
+            return cls_logits_list, reg_preds_list, angle_preds_list
+        else:
+            return cls_logits_list, reg_preds_list

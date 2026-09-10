@@ -2,23 +2,46 @@ import os
 import argparse
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from config import Config
 from model import DetectFCOS
+from utils import LOG_SCALE_MIN, LOG_SCALE_MAX
 
 
 class DetectFCOSWrapper(nn.Module):
-    """将多层输出拼接，并解码为 (cx,cy,w,h) 归一化，probs 输出概率"""
-    def __init__(self, model: DetectFCOS, img_size: int):
+    """
+    统一的 ONNX 导出包装。
+
+    detect 模式输出:
+        probs:   (B, N, C)  已经过 sigmoid 的概率
+        bboxes:  (B, N, 4)  归一化 (cx, cy, w, h)
+
+    obb 模式输出:
+        probs:   (B, N, C)  已经过 sigmoid 的概率
+        bboxes:  (B, N, 4)  归一化 (cx, cy, w, h)
+        angles:  (B, N, 2)  sin_cos 模式 -> [sin, cos]
+                            direct 模式 -> [angle, 0]（第二维恒为 0 占位）
+    """
+    def __init__(self, model: DetectFCOS, img_size: int,
+                 mode: str = 'detect', angle_format: str = 'sin_cos'):
         super().__init__()
         self.model = model
         self.img_size = img_size
         self.strides = model.strides
+        self.mode = mode
+        self.angle_format = angle_format
 
     def forward(self, x):
-        cls_logits_list, reg_preds_list = self.model(x)
+        if self.mode == 'obb':
+            cls_logits_list, reg_preds_list, angle_preds_list = self.model(x)
+        else:
+            cls_logits_list, reg_preds_list = self.model(x)
+            angle_preds_list = None
+
         all_probs = []
         all_bboxes = []
+        all_angles = []
 
         for level_idx, (cls_l, reg_l) in enumerate(zip(cls_logits_list, reg_preds_list)):
             b, c, h, w = cls_l.shape
@@ -33,22 +56,34 @@ class DetectFCOSWrapper(nn.Module):
 
             # reg_l: (B,4,H,W) -> (B,4,H*W)
             reg_flat = reg_l.view(b, 4, -1)
-            l = reg_flat[:, 0, :]
-            t = reg_flat[:, 1, :]
-            r = reg_flat[:, 2, :]
-            b_ = reg_flat[:, 3, :]
 
-            # 解码为 x1,y1,x2,y2
-            x1 = grid_x_flat.unsqueeze(0) - l
-            y1 = grid_y_flat.unsqueeze(0) - t
-            x2 = grid_x_flat.unsqueeze(0) + r
-            y2 = grid_y_flat.unsqueeze(0) + b_
+            if self.mode == 'obb':
+                # ---- OBB 解码：[dx, dy, dw, dh] ----
+                dx = reg_flat[:, 0, :]
+                dy = reg_flat[:, 1, :]
+                dw = reg_flat[:, 2, :]
+                dh = reg_flat[:, 3, :]
 
-            # 计算 cx,cy,w,h
-            cx = (x1 + x2) / 2
-            cy = (y1 + y2) / 2
-            w_ = x2 - x1
-            h_ = y2 - y1
+                cx = grid_x_flat.unsqueeze(0) + dx * stride
+                cy = grid_y_flat.unsqueeze(0) + dy * stride
+                w_ = torch.exp(dw.clamp(LOG_SCALE_MIN, LOG_SCALE_MAX)) * stride
+                h_ = torch.exp(dh.clamp(LOG_SCALE_MIN, LOG_SCALE_MAX)) * stride
+            else:
+                # ---- detect 解码：[l, t, r, b]（与 utils.post_process 严格对齐） ----
+                l = F.relu(reg_flat[:, 0, :])
+                t = F.relu(reg_flat[:, 1, :])
+                r = F.relu(reg_flat[:, 2, :])
+                b_ = F.relu(reg_flat[:, 3, :])
+
+                x1 = grid_x_flat.unsqueeze(0) - l
+                y1 = grid_y_flat.unsqueeze(0) - t
+                x2 = grid_x_flat.unsqueeze(0) + r
+                y2 = grid_y_flat.unsqueeze(0) + b_
+
+                cx = (x1 + x2) / 2
+                cy = (y1 + y2) / 2
+                w_ = x2 - x1
+                h_ = y2 - y1
 
             # 归一化到 [0,1]
             cx = cx / self.img_size
@@ -56,7 +91,6 @@ class DetectFCOSWrapper(nn.Module):
             w_ = w_ / self.img_size
             h_ = h_ / self.img_size
 
-            # 裁剪确保在 [0,1] 内
             cx = torch.clamp(cx, 0, 1)
             cy = torch.clamp(cy, 0, 1)
             w_ = torch.clamp(w_, 0, 1)
@@ -64,22 +98,45 @@ class DetectFCOSWrapper(nn.Module):
 
             bboxes_decoded = torch.stack([cx, cy, w_, h_], dim=2)  # (B, H*W, 4)
 
-            # 分类：先应用 sigmoid 得到概率，再展平
-            cls_prob = torch.sigmoid(cls_l)                     # (B, C, H, W)
-            prob_flat = cls_prob.view(b, c, -1).permute(0, 2, 1) # (B, H*W, C)
+            # 分类：sigmoid 得到概率
+            cls_prob = torch.sigmoid(cls_l)                        # (B, C, H, W)
+            prob_flat = cls_prob.view(b, c, -1).permute(0, 2, 1)   # (B, H*W, C)
 
             all_probs.append(prob_flat)
             all_bboxes.append(bboxes_decoded)
 
-        probs_out = torch.cat(all_probs, dim=1)   # (B, total_points, C)
-        bboxes_out = torch.cat(all_bboxes, dim=1) # (B, total_points, 4)
+            # OBB 角度（原始输出，不做归一化，客户端自行处理）
+            if self.mode == 'obb':
+                angle_pred = angle_preds_list[level_idx]  # (B, 1 or 2, H, W)
+                if self.angle_format == 'sin_cos':
+                    # (B, 2, H*W) -> (B, H*W, 2)
+                    angle_flat = angle_pred.view(b, 2, -1).permute(0, 2, 1)
+                else:
+                    # direct: (B, 1, H*W) -> (B, H*W, 1)
+                    angle_flat = angle_pred.view(b, 1, -1).permute(0, 2, 1)
+                    # 占位第二维，保持输出 shape 统一为 (B, N, 2)
+                    angle_flat = torch.cat(
+                        [angle_flat, torch.zeros_like(angle_flat)], dim=2
+                    )
+                all_angles.append(angle_flat)
+
+        probs_out = torch.cat(all_probs, dim=1)     # (B, N, C)
+        bboxes_out = torch.cat(all_bboxes, dim=1)   # (B, N, 4)
+
+        if self.mode == 'obb':
+            angles_out = torch.cat(all_angles, dim=1)  # (B, N, 2)
+            return probs_out, bboxes_out, angles_out
         return probs_out, bboxes_out
 
 
 def parse_args():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description='SWAP-Fighter ONNX Exporter')
     parser.add_argument('--weights', required=True, help='模型权重文件')
     parser.add_argument('--output', default='model.onnx', help='输出 ONNX 路径')
+    parser.add_argument('--mode', default=None, choices=['detect', 'obb'],
+                        help='检测模式（覆盖 config）')
+    parser.add_argument('--angle-format', default=None, choices=['sin_cos', 'direct'],
+                        help='OBB 角度编码（覆盖 config）')
     parser.add_argument('--backbone', default=None, help='Backbone 名称')
     parser.add_argument('--num-classes', type=int, default=None, help='类别数')
     parser.add_argument('--img-size', type=int, default=None, help='输入尺寸')
@@ -90,11 +147,14 @@ def parse_args():
     return parser.parse_args()
 
 
-def load_model(weights, backbone, num_classes, device):
-    cfg = Config()
-    backbone = backbone or cfg.backbone_name
-    num_classes = num_classes or cfg.num_classes
-    model = DetectFCOS(num_classes=num_classes, backbone_name=backbone, pretrained=False)
+def load_model(weights, backbone, num_classes, mode, angle_format, device):
+    model = DetectFCOS(
+        num_classes=num_classes,
+        backbone_name=backbone,
+        pretrained=False,
+        with_angle=(mode == 'obb'),
+        angle_format=angle_format,
+    )
     ckpt = torch.load(weights, map_location=device)
     if 'model_state_dict' in ckpt:
         sd = ckpt['model_state_dict']
@@ -109,7 +169,7 @@ def load_model(weights, backbone, num_classes, device):
     model.load_state_dict(new_sd)
     model.to(device).eval()
     print(f"模型加载成功: {weights}")
-    print(f"  Backbone: {backbone}, 类别数: {num_classes}")
+    print(f"  Backbone: {backbone}, 类别数: {num_classes}, 模式: {mode}")
     return model
 
 
@@ -127,25 +187,33 @@ def remove_initializer_from_input(onnx_path):
         print(f"  移除初始值设定项失败: {e}")
 
 
-def export_onnx(model, dummy_input, output_path, dynamic, simplify, opset):
-    model = model.cpu()
+def export_onnx(wrapper, dummy_input, output_path, dynamic, simplify, opset, mode):
+    wrapper = wrapper.cpu()
     dummy_input = dummy_input.cpu()
+
     input_names = ['input']
-    output_names = ['probs', 'bboxes']
+    if mode == 'obb':
+        output_names = ['probs', 'bboxes', 'angles']
+    else:
+        output_names = ['probs', 'bboxes']
+
     dynamic_axes = {}
     if dynamic:
         dynamic_axes['input'] = {0: 'batch_size'}
-        dynamic_axes['probs'] = {0: 'batch_size'}
-        dynamic_axes['bboxes'] = {0: 'batch_size'}
+        for name in output_names:
+            dynamic_axes[name] = {0: 'batch_size'}
 
     print(f"导出 ONNX 到 {output_path}")
     print(f"  Opset: {opset}, 动态批次: {dynamic}")
     print(f"  输入形状: {dummy_input.shape}")
-    print(f"  输出: probs (概率值 0~1), bboxes (cx,cy,w,h 归一化)")
+    if mode == 'obb':
+        print(f"  输出: probs (概率 0~1), bboxes (cx,cy,w,h 归一化), angles (sin_cos 或 angle+占位)")
+    else:
+        print(f"  输出: probs (概率 0~1), bboxes (cx,cy,w,h 归一化)")
 
     with torch.no_grad():
         torch.onnx.export(
-            model,
+            wrapper,
             dummy_input,
             output_path,
             input_names=input_names,
@@ -165,9 +233,11 @@ def export_onnx(model, dummy_input, output_path, dynamic, simplify, opset):
         try:
             import onnx, onnxsim
             onnx_model = onnx.load(output_path)
-            model_simp, check = onnxsim.simplify(onnx_model,
-                                                  dynamic_input_shape=dynamic,
-                                                  input_shapes={'input': dummy_input.shape})
+            model_simp, check = onnxsim.simplify(
+                onnx_model,
+                dynamic_input_shape=dynamic,
+                input_shapes={'input': dummy_input.shape}
+            )
             if check:
                 onnx.save(model_simp, output_path)
                 remove_initializer_from_input(output_path)
@@ -185,7 +255,7 @@ def export_onnx(model, dummy_input, output_path, dynamic, simplify, opset):
         onnx_model = onnx.load(output_path)
         onnx.checker.check_model(onnx_model)
         print("  ONNX 模型验证通过")
-        size_mb = os.path.getsize(output_path) / (1024*1024)
+        size_mb = os.path.getsize(output_path) / (1024 * 1024)
         print(f"  文件大小: {size_mb:.2f} MB")
     except Exception as e:
         print(f"  验证警告: {e}")
@@ -194,27 +264,39 @@ def export_onnx(model, dummy_input, output_path, dynamic, simplify, opset):
 def main():
     args = parse_args()
     cfg = Config()
+
     device = torch.device('cpu')
     img_size = args.img_size or cfg.img_size
     num_classes = args.num_classes or cfg.num_classes
     backbone = args.backbone or cfg.backbone_name
+    mode = args.mode or cfg.mode
+    angle_format = args.angle_format or cfg.angle_format
 
-    print("="*60)
+    print("=" * 60)
     print("SWAP-Fighter ONNX Exporter")
-    print("="*60)
+    print("=" * 60)
+    print(f"模式: {mode}")
+    if mode == 'obb':
+        print(f"角度编码: {angle_format}")
     print(f"输入尺寸: {img_size}")
 
-    model = load_model(args.weights, backbone, num_classes, device)
-    wrapper = DetectFCOSWrapper(model, img_size).to(device).eval()
+    model = load_model(args.weights, backbone, num_classes, mode, angle_format, device)
+    wrapper = DetectFCOSWrapper(model, img_size, mode=mode, angle_format=angle_format)
+    wrapper.to(device).eval()
 
     dummy = torch.randn(args.batch_size, 3, img_size, img_size, device=device)
 
     with torch.no_grad():
-        test_probs, test_bboxes = wrapper(dummy)
-        print(f"示例输出形状: probs (概率) {test_probs.shape}, bboxes {test_bboxes.shape}")
+        outputs = wrapper(dummy)
+        if mode == 'obb':
+            test_probs, test_bboxes, test_angles = outputs
+            print(f"示例输出形状: probs {test_probs.shape}, bboxes {test_bboxes.shape}, angles {test_angles.shape}")
+        else:
+            test_probs, test_bboxes = outputs
+            print(f"示例输出形状: probs {test_probs.shape}, bboxes {test_bboxes.shape}")
         print(f"总点数: {test_probs.shape[1]}")
 
-    export_onnx(wrapper, dummy, args.output, args.dynamic, args.simplify, args.opset)
+    export_onnx(wrapper, dummy, args.output, args.dynamic, args.simplify, args.opset, mode)
     print(f"\n导出完成: {args.output}")
 
 

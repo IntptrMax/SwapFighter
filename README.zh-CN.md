@@ -2,7 +2,7 @@
 
 **“换掉你的骨干，为更好的检测而战。”**
 
-SWAP-Fighter 是一个受 **FCOS** 启发的模块化、无锚框目标检测框架。它允许你将不同的 `timm` 骨干网络接入统一的 Neck 和解耦多任务 Head，并同时支持：
+SWAP-Fighter 是一个受 **FCOS** 和 **YOLOv8** 启发的模块化、无锚框目标检测框架。它允许你将不同的 `timm` 骨干网络接入统一的 Neck 和解耦多任务 Head，并同时支持：
 
 - **`detect`**：水平框检测
 - **`obb`**：旋转框检测，带角度预测
@@ -18,23 +18,24 @@ SWAP-Fighter 是一个受 **FCOS** 启发的模块化、无锚框目标检测框
   - `detect`：水平框
   - `obb`：旋转框 + 角度回归
 - **统一的无锚框检测头**
-  - 分类：默认使用 **Focal Loss**
+  - **解耦头**：分类、回归、角度分别使用独立的卷积塔。
+  - 分类：**Focal Loss** 风格（BCE + 目标分数归一化）。
   - 回归：
-    - `detect`：**GIoU Loss**
-    - `obb`：**CRIoU + ProbIoU + Center L1**
+    - `detect`：**CIoU Loss** + 可选 **DFL**（Distribution Focal Loss）。
+    - `obb`：**CRIoU + ProbIoU** 或 **KLD Loss**（可选）+ 可选 **DFL**。
   - 角度：
     - `sin_cos`：余弦损失 + 周期 L1 辅助损失
     - `direct`：周期 L1 损失
-- **FCOS 风格正样本分配**
-  - 中心采样
-  - 基于面积分配 GT
-  - 每个 GT 保证最少正样本数
+- **Task-Aligned Assigner (TAL)** 正样本分配。
+  - 参数：`tal_topk`、`tal_alpha`、`tal_beta`。
 - **完整训练流程**
   - 精度：`fp32`、`fp16`、`bf16`
   - `fp16` 自动使用 `GradScaler`
-  - warmup + cosine / step / multistep / lambda / OneCycle 调度器
+  - Warmup + cosine / step / multistep / lambda / OneCycle 调度器
   - 梯度裁剪
   - 分阶段冻结 / 解冻 Backbone
+  - EMA（指数移动平均）
+  - 早停（patience）
   - 支持断点恢复
 - **灵活的数据集支持**
   - YOLO 风格目录结构
@@ -42,16 +43,18 @@ SWAP-Fighter 是一个受 **FCOS** 启发的模块化、无锚框目标检测框
   - `obb` 标签：`class x1 y1 x2 y2 x3 y3 x4 y4`
   - 两种标签格式可互相兼容读取
 - **内置评估指标**
-  - `detect`：通过 `torchmetrics` 计算 mAP@0.5、mAP@0.5:0.95、AR@100
-  - `obb`：通过 `shapely` 计算旋转 IoU 的 mAP@0.5、mAP@0.5:0.95
+  - `detect`：mAP@0.5、mAP@0.5:0.95、AR@100（自定义 YOLOv8 风格实现）
+  - `obb`：基于 ProbIoU 的旋转 IoU mAP@0.5、mAP@0.5:0.95
 - **丰富的可视化与日志**
   - CSV 训练日志
-  - 自动绘制训练曲线
+  - 自动绘制训练曲线（`results.png`）
   - 自动创建 `runX` 输出目录
   - 单图推理自适应字体和颜色
 - **部署支持**
   - 支持 `detect` 和 `obb` 的 ONNX 导出
   - 提供 ONNX Runtime 推理示例
+- **SimMIM 自监督预训练**（`simmim_pretrain.py`）
+  - 生成的权重可直接被 SWAP-Fighter 的 Backbone 加载，无需任何归一化。
 
 ---
 
@@ -103,14 +106,11 @@ pip install -r requirements.txt
 - numpy
 - tqdm
 - matplotlib
-- torchmetrics
-- shapely
 - onnx
 - onnxruntime
 - onnxsim / onnx-simplifier（可选，用于 `--simplify`）
 
-> `shapely` 用于旋转 NMS 和 OBB mAP 评估。  
-> `torchmetrics` 用于水平框 mAP 评估。
+> 不再需要 `shapely` 或 `torchmetrics` —— 评估和旋转 NMS 均使用纯 NumPy / PyTorch 实现。
 
 ---
 
@@ -207,13 +207,15 @@ python train.py \
 python train.py \
     --mode obb \
     --angle-format sin_cos \
+    --angle-range pi \
     --data-root ./datasets/dota_like \
     --backbone convnextv2_tiny \
     --img-size 1024 \
     --batch-size 8 \
     --epochs 100 \
     --precision fp16 \
-    --angle-weight 2.0
+    --angle-weight 2.0 \
+    --obb-reg-loss probiou
 ```
 
 > `angle_range` 在 `config.py` 中配置，可选 `pi` 或 `pi2`。  
@@ -223,16 +225,20 @@ python train.py \
 
 - `--mode detect|obb`：选择水平框或旋转框检测。
 - `--angle-format sin_cos|direct`：OBB 角度编码方式。
+- `--angle-range pi|pi2`：OBB 角度范围。
 - `--precision fp32|fp16|bf16`：训练精度。
 - `--optimizer sgd|adamw`：优化器类型。
 - `--scheduler lambda|step|multistep|cosine|onecycle`：学习率调度器。
 - `--warmup-epochs N`：非 OneCycle 调度器的 warmup 轮数。
 - `--freeze-epochs N`：前 N 轮冻结 Backbone。
-- `--unfreeze-lr LR`：Backbone 解冻后的学习率。
+- `--backbone-lr-scale S`：Backbone 学习率缩放系数（默认 0.1）。
 - `--eval-fp32`：验证损失强制 FP32，更稳定。
 - `--eval-map-start-epoch N`：从第 N 轮开始计算 mAP。
 - `--mosaic-prob P`：Mosaic 概率。
 - `--mosaic-disable-epoch N`：第 N 轮后禁用 Mosaic。
+- `--patience N`：早停耐心值（0 = 禁用）。
+- `--use-ema` / `--no-ema`：启用/禁用 EMA（默认启用）。
+- `--ema-decay D`：EMA 衰减率。
 - `--no-plot`：禁用训练曲线绘制。
 - `--resume path/to/checkpoint.pth`：从检查点恢复训练。
 
@@ -243,10 +249,11 @@ runX/
 ├── best.pth
 ├── last.pth
 ├── final.pth
+├── final_ema.pth
 ├── epoch_N.pth
 ├── training_log.csv
 ├── config.json
-└── training_curves.png
+└── results.png
 ```
 
 ---
@@ -280,7 +287,9 @@ python infer.py \
     --class-names plane ship vehicle
 ```
 
-可使用 `--output-txt` 将检测结果保存为文本文件。
+可使用 `--output-txt` 将检测结果保存为文本文件。  
+可使用 `--output-json` 将检测结果保存为 JSON 文件。  
+可使用 `--no-show` 禁用显示窗口（无 GUI 环境）。
 
 ---
 
@@ -308,6 +317,7 @@ python export.py \
     --output model_obb.onnx \
     --mode obb \
     --angle-format sin_cos \
+    --angle-range pi \
     --img-size 640 \
     --dynamic \
     --simplify
@@ -325,7 +335,7 @@ python export.py \
     - `sin_cos`：`[sin, cos]`
     - `direct`：`[angle, 0]`，第二维为占位
 
-> OBB 导出时的 `angle_range` 从 `config.py` 读取。
+> OBB 导出时的 `angle_range` 从 `config.py` 读取，或通过 `--angle-range` 覆盖。
 
 ---
 
@@ -361,30 +371,65 @@ python onnx_demo.py \
 
 ---
 
+### 7. SimMIM 自监督预训练
+
+SWAP-Fighter 包含 `simmim_pretrain.py`，可在无标注图像上对 Backbone 进行 SimMIM 自监督预训练，生成的权重可直接用于检测器训练。
+
+#### 预训练
+
+```bash
+python simmim_pretrain.py \
+    --data-dir ./datasets/unlabeled_images \
+    --backbone convnextv2_atto \
+    --img-size 224 \
+    --mask-patch-size 32 \
+    --mask-ratio 0.6 \
+    --epochs 100 \
+    --batch-size 64 \
+    --lr 1e-4 \
+    --precision fp16 \
+    --output ./simmim_pretrained/convnextv2_atto_simmim.pth
+```
+
+#### 在训练中使用预训练权重
+
+```bash
+python train.py \
+    --mode detect \
+    --data-root ./datasets/my_data \
+    --backbone convnextv2_atto \
+    --pretrained-source simmim \
+    --backbone-pretrained-path ./simmim_pretrained/convnextv2_atto_simmim.pth \
+    --img-size 640 \
+    --batch-size 16 \
+    --epochs 100
+```
+
+保存的 state dict 与 `Backbone` 类完全兼容，无需任何键名归一化。
+
+---
+
 ## 🧠 工作原理
 
 1. **Backbone** 通过 `timm` 提取多尺度特征图。
-2. **LightFPN** 融合不同层级的特征。
+2. **LightFPN** 或 **BiFPN** 融合不同层级的特征。
 3. **解耦多任务 Head** 预测：
    - 分类 logits
-   - 边界框回归
+   - 边界框回归（可选 DFL）
    - OBB 模式下的角度
-4. **正样本分配** 采用 FCOS 风格的无锚框策略：
-   - 中心采样
-   - 基于面积分配
-   - 每个 GT 保证最少正样本数
+4. **Task-Aligned Assigner (TAL)** 基于分类得分和 IoU 分配正样本。
 5. **损失函数**
-   - 分类：Focal Loss
-   - `detect` 回归：GIoU
-   - `obb` 回归：CRIoU + ProbIoU + Center L1
+   - 分类：Focal Loss 风格（BCE + 目标分数归一化）
+   - `detect` 回归：CIoU + 可选 DFL
+   - `obb` 回归：CRIoU + ProbIoU（或 KLD）+ 可选 DFL
    - 角度：周期 L1，或余弦 + 周期 L1
 6. **后处理**
    - 置信度阈值
    - `detect`：水平 NMS
-   - `obb`：旋转 NMS
+   - `obb`：基于 ProbIoU 的旋转 NMS
 7. **评估**
-   - `detect`：torchmetrics mAP
-   - `obb`：shapely 旋转 IoU mAP
+   - `detect`：自定义 YOLOv8 风格 mAP
+   - `obb`：基于 ProbIoU 的旋转 mAP
 
 整个流程高度模块化：替换 Backbone 时，无需修改 Neck、Head、损失和后处理代码。
 
@@ -400,15 +445,22 @@ python onnx_demo.py \
 - `data_root`、`train_split`、`val_split`、`num_classes`
 - `backbone_name`、`pretrained`、`img_size`
 - `neck_out_channels`、`head_num_convs`、`use_extra_conv`
+- `neck_type`、`neck_num_layers`
+- `head_type`、`head_norm_layer`、`head_act_layer`
+- `head_cls_num_convs`、`head_reg_num_convs`、`head_angle_num_convs`
 - `with_angle`、`angle_range`、`angle_format`
-- `batch_size`、`lr`、`unfreeze_lr`、`weight_decay`、`epochs`
+- `reg_max`、`dfl_weight`
+- `obb_reg_loss`、`kld_weight`、`kld_tau`、`kld_fun`
+- `batch_size`、`lr`、`backbone_lr_scale`、`weight_decay`、`epochs`
 - `warmup_epochs`、`optimizer`、`scheduler`
 - `precision`：`fp32`、`fp16`、`bf16`
 - `freeze_epochs`
 - `mosaic_prob`、`mosaic_disable_epoch`
 - `conf_threshold`、`nms_threshold`、`obb_nms_threshold`
 - `mean`、`std`
-- `eval_map_start_epoch`
+- `eval_map_start_epoch`、`eval_conf_threshold`
+- `patience`、`use_ema`、`ema_decay`
+- `tal_topk`、`tal_alpha`、`tal_beta`
 
 ---
 
@@ -416,16 +468,17 @@ python onnx_demo.py \
 
 ```text
 SWAP-Fighter/
-├── config.py          # 全局配置
-├── dataset.py         # YOLO 风格数据集，含 Letterbox、增强、Mosaic
-├── model.py           # Backbone、LightFPN、检测头、DetectFCOS
-├── train.py           # 训练循环、日志、检查点、绘图
-├── infer.py           # 单张图片 PyTorch 推理
-├── export.py          # ONNX 导出器
-├── onnx_demo.py       # ONNX Runtime 推理演示
-├── utils.py           # 损失函数、后处理、NMS、mAP、Letterbox
-├── README.md          # 英文说明
-└── README.zh-CN.md    # 中文说明
+├── config.py             # 全局配置
+├── dataset.py            # YOLO 风格数据集，含 Letterbox、增强、Mosaic、MixUp、Copy-Paste
+├── model.py              # Backbone、LightFPN/BiFPN、DecoupledHead、DetectFCOS
+├── train.py              # 训练循环、日志、检查点、绘图
+├── infer.py              # 单张图片 PyTorch 推理
+├── export.py             # ONNX 导出器
+├── onnx_demo.py          # ONNX Runtime 推理演示
+├── simmim_pretrain.py    # SimMIM 自监督预训练
+├── utils.py              # 损失函数、后处理、NMS、mAP、Letterbox
+├── README.md             # 英文说明
+└── README.zh-CN.md       # 中文说明
 ```
 
 ---
@@ -436,7 +489,7 @@ SWAP-Fighter/
 - `fp16` 会自动使用 `GradScaler`。
 - `bf16` 需要 Ampere 或更新架构 GPU，否则自动回退到 `fp16`。
 - 非 CUDA 设备自动使用 `fp32`。
-- OBB 旋转 NMS 和 OBB mAP 需要安装 `shapely`。
+- OBB 旋转 NMS 和 OBB mAP 均使用纯 NumPy / PyTorch 实现，无需安装 `shapely`。
 - ONNX 后处理依赖正确的 `--strides`。
 
 ---
@@ -456,9 +509,9 @@ SWAP-Fighter/
 ## 🙏 致谢
 
 - [FCOS](https://github.com/tianzhi0549/FCOS) – 原始无锚框检测思想。
+- [YOLOv8](https://github.com/ultralytics/ultralytics) – TAL 分配器、解耦头及训练流程灵感。
 - [timm](https://github.com/huggingface/pytorch-image-models) – 大量预训练骨干网络。
-- [torchmetrics](https://torchmetrics.readthedocs.io/) – 水平框 mAP 计算。
-- [shapely](https://shapely.readthedocs.io/) – 旋转 IoU 和 OBB 评估。
+- [SimMIM](https://github.com/microsoft/SimMIM) – 掩码图像建模预训练。
 
 ---
 

@@ -2,12 +2,12 @@
 
 **"Swap your backbone, fight for better detection."**
 
-SWAP-Fighter is a modular anchor-free object detection framework inspired by **FCOS**. It allows you to plug different `timm` backbones into a unified neck and a decoupled multi-task head, supporting both:
+SWAP-Fighter is a modular anchor-free object detection framework inspired by **FCOS** and **YOLOv8**. It allows you to plug different `timm` backbones into a unified neck and a decoupled multi-task head, supporting both:
 
 - **`detect`**: horizontal bounding box detection
 - **`obb`**: oriented bounding box detection with angle prediction
 
-> Chinese name: **接头霸王** – because you can “connect” almost any backbone you want.
+> Chinese name: **接头霸王** – because you can "connect" almost any backbone you want.
 
 ---
 
@@ -18,40 +18,43 @@ SWAP-Fighter is a modular anchor-free object detection framework inspired by **F
   - `detect`: horizontal boxes
   - `obb`: oriented boxes with angle regression
 - **Unified anchor-free detection head**
-  - Classification: **Focal Loss** by default.
+  - **Decoupled head** with independent convolution towers for classification, regression, and angle.
+  - Classification: **Focal Loss** style (BCE with target score normalization).
   - Regression:
-    - `detect`: **GIoU Loss**
-    - `obb`: **CRIoU + ProbIoU + Center L1**
+    - `detect`: **CIoU Loss** + optional **DFL** (Distribution Focal Loss).
+    - `obb`: **CRIoU + ProbIoU** or **KLD Loss** (selectable) + optional **DFL**.
   - Angle:
     - `sin_cos`: cosine loss + periodic L1 auxiliary loss
     - `direct`: periodic L1 loss
-- **FCOS-style positive sample assignment**
-  - center sampling
-  - area-based GT assignment
-  - minimum positive samples per GT
+- **Task-Aligned Assigner (TAL)** for positive sample assignment.
+  - Parameters: `tal_topk`, `tal_alpha`, `tal_beta`.
 - **Full training pipeline**
   - AMP precision: `fp32`, `fp16`, `bf16`
   - `GradScaler` for `fp16`
-  - warmup + cosine / step / multistep / lambda / OneCycle schedulers
-  - gradient clipping
-  - staged backbone freezing and unfreezing
-  - resume from checkpoint
+  - Warmup + cosine / step / multistep / lambda / OneCycle schedulers
+  - Gradient clipping
+  - Staged backbone freezing and unfreezing
+  - EMA (Exponential Moving Average) of model weights
+  - Early stopping with patience
+  - Resume from checkpoint
 - **Flexible dataset support**
   - YOLO-style folder structure
   - `detect` labels: `class cx cy w h`
   - `obb` labels: `class x1 y1 x2 y2 x3 y3 x4 y4`
   - Cross-compatible label reading
 - **Built-in evaluation**
-  - `detect`: mAP@0.5, mAP@0.5:0.95, AR@100 via `torchmetrics`
-  - `obb`: rotated IoU mAP@0.5 and mAP@0.5:0.95 via `shapely`
+  - `detect`: mAP@0.5, mAP@0.5:0.95, AR@100 (custom YOLOv8-style implementation)
+  - `obb`: rotated IoU mAP@0.5 and mAP@0.5:0.95 (ProbIoU-based)
 - **Rich visualisation and logging**
   - CSV training logs
-  - automatic training curves
+  - Automatic training curves (`results.png`)
   - `runX` output folders
-  - single-image inference with adaptive font and colours
+  - Single-image inference with adaptive font and colours
 - **Deployment**
   - ONNX export for both `detect` and `obb`
   - ONNX Runtime inference demo
+- **SimMIM self-supervised pre-training** for backbones (`simmim_pretrain.py`).
+  - Generates weights directly compatible with SWAP-Fighter's backbone loading.
 
 ---
 
@@ -103,14 +106,11 @@ pip install -r requirements.txt
 - numpy
 - tqdm
 - matplotlib
-- torchmetrics
-- shapely
 - onnx
 - onnxruntime
 - onnxsim / onnx-simplifier (optional, for `--simplify`)
 
-> `shapely` is required for rotated NMS and OBB mAP evaluation.  
-> `torchmetrics` is used for horizontal-box mAP evaluation.
+> No `shapely` or `torchmetrics` required – evaluation and rotated NMS are implemented in pure NumPy / PyTorch.
 
 ---
 
@@ -207,13 +207,15 @@ python train.py \
 python train.py \
     --mode obb \
     --angle-format sin_cos \
+    --angle-range pi \
     --data-root ./datasets/dota_like \
     --backbone convnextv2_tiny \
     --img-size 1024 \
     --batch-size 8 \
     --epochs 100 \
     --precision fp16 \
-    --angle-weight 2.0
+    --angle-weight 2.0 \
+    --obb-reg-loss probiou
 ```
 
 > `angle_range` is configured in `config.py` (`pi` or `pi2`).  
@@ -223,16 +225,20 @@ python train.py \
 
 - `--mode detect|obb`: select horizontal or oriented detection.
 - `--angle-format sin_cos|direct`: OBB angle encoding.
+- `--angle-range pi|pi2`: OBB angle range.
 - `--precision fp32|fp16|bf16`: training precision.
 - `--optimizer sgd|adamw`: optimizer type.
 - `--scheduler lambda|step|multistep|cosine|onecycle`: LR scheduler.
 - `--warmup-epochs N`: warmup epochs for non-OneCycle schedulers.
 - `--freeze-epochs N`: freeze backbone for the first N epochs.
-- `--unfreeze-lr LR`: learning rate after backbone unfreezing.
+- `--backbone-lr-scale S`: learning rate scale for backbone (default 0.1).
 - `--eval-fp32`: force FP32 validation loss for more stable evaluation.
 - `--eval-map-start-epoch N`: skip mAP computation before epoch N.
 - `--mosaic-prob P`: Mosaic probability.
 - `--mosaic-disable-epoch N`: disable Mosaic after epoch N.
+- `--patience N`: early stopping patience (0 = disabled).
+- `--use-ema` / `--no-ema`: enable/disable EMA (default enabled).
+- `--ema-decay D`: EMA decay rate.
 - `--no-plot`: disable training curve plotting.
 - `--resume path/to/checkpoint.pth`: resume training.
 
@@ -243,10 +249,11 @@ runX/
 ├── best.pth
 ├── last.pth
 ├── final.pth
+├── final_ema.pth
 ├── epoch_N.pth
 ├── training_log.csv
 ├── config.json
-└── training_curves.png
+└── results.png
 ```
 
 ---
@@ -280,7 +287,9 @@ python infer.py \
     --class-names plane ship vehicle
 ```
 
-Use `--output-txt` to save detections to a text file.
+Use `--output-txt` to save detections to a text file.  
+Use `--output-json` to save detections to a JSON file.  
+Use `--no-show` to disable the display window (for headless environments).
 
 ---
 
@@ -308,6 +317,7 @@ python export.py \
     --output model_obb.onnx \
     --mode obb \
     --angle-format sin_cos \
+    --angle-range pi \
     --img-size 640 \
     --dynamic \
     --simplify
@@ -325,7 +335,7 @@ Exported outputs:
     - `sin_cos`: `[sin, cos]`
     - `direct`: `[angle, 0]`, second value is a placeholder
 
-> `angle_range` for OBB export is read from `config.py`.
+> `angle_range` for OBB export is read from `config.py` or overridden via `--angle-range`.
 
 ---
 
@@ -361,30 +371,65 @@ python onnx_demo.py \
 
 ---
 
+### 7. SimMIM Self-Supervised Pre-training
+
+SWAP-Fighter includes `simmim_pretrain.py` to pre-train a backbone with SimMIM on your own unlabeled images. The resulting weights can be loaded directly into the detector.
+
+#### Pre-training
+
+```bash
+python simmim_pretrain.py \
+    --data-dir ./datasets/unlabeled_images \
+    --backbone convnextv2_atto \
+    --img-size 224 \
+    --mask-patch-size 32 \
+    --mask-ratio 0.6 \
+    --epochs 100 \
+    --batch-size 64 \
+    --lr 1e-4 \
+    --precision fp16 \
+    --output ./simmim_pretrained/convnextv2_atto_simmim.pth
+```
+
+#### Using the pre-trained weights in training
+
+```bash
+python train.py \
+    --mode detect \
+    --data-root ./datasets/my_data \
+    --backbone convnextv2_atto \
+    --pretrained-source simmim \
+    --backbone-pretrained-path ./simmim_pretrained/convnextv2_atto_simmim.pth \
+    --img-size 640 \
+    --batch-size 16 \
+    --epochs 100
+```
+
+The saved state dict is directly compatible with the `Backbone` class – no key normalization needed.
+
+---
+
 ## 🧠 How It Works
 
 1. **Backbone** extracts multi-scale feature maps via `timm`.
-2. **LightFPN** fuses features from different levels.
+2. **LightFPN** or **BiFPN** fuses features from different levels.
 3. **Decoupled multi-task head** predicts:
    - classification logits
-   - box regression
+   - box regression (with optional DFL)
    - angle prediction for OBB mode
-4. **Positive assignment** follows an FCOS-style anchor-free strategy:
-   - center sampling
-   - area-based assignment
-   - minimum positive samples per GT
+4. **Task-Aligned Assigner (TAL)** assigns positive samples based on classification score and IoU.
 5. **Losses**
-   - classification: Focal Loss
-   - `detect` regression: GIoU
-   - `obb` regression: CRIoU + ProbIoU + Center L1
+   - classification: Focal Loss style (BCE normalized by target scores)
+   - `detect` regression: CIoU + optional DFL
+   - `obb` regression: CRIoU + ProbIoU (or KLD) + optional DFL
    - angle: periodic L1 or cosine + periodic L1
 6. **Post-processing**
    - confidence threshold
    - horizontal NMS for `detect`
-   - rotated NMS for `obb`
+   - rotated NMS (ProbIoU-based) for `obb`
 7. **Evaluation**
-   - `detect`: torchmetrics mAP
-   - `obb`: shapely rotated IoU mAP
+   - `detect`: custom YOLOv8-style mAP
+   - `obb`: ProbIoU-based rotated mAP
 
 The backbone is fully swappable without changing the neck, head, loss, or post-processing code.
 
@@ -400,15 +445,22 @@ Key parameters:
 - `data_root`, `train_split`, `val_split`, `num_classes`
 - `backbone_name`, `pretrained`, `img_size`
 - `neck_out_channels`, `head_num_convs`, `use_extra_conv`
+- `neck_type`, `neck_num_layers`
+- `head_type`, `head_norm_layer`, `head_act_layer`
+- `head_cls_num_convs`, `head_reg_num_convs`, `head_angle_num_convs`
 - `with_angle`, `angle_range`, `angle_format`
-- `batch_size`, `lr`, `unfreeze_lr`, `weight_decay`, `epochs`
+- `reg_max`, `dfl_weight`
+- `obb_reg_loss`, `kld_weight`, `kld_tau`, `kld_fun`
+- `batch_size`, `lr`, `backbone_lr_scale`, `weight_decay`, `epochs`
 - `warmup_epochs`, `optimizer`, `scheduler`
 - `precision`: `fp32`, `fp16`, `bf16`
 - `freeze_epochs`
 - `mosaic_prob`, `mosaic_disable_epoch`
 - `conf_threshold`, `nms_threshold`, `obb_nms_threshold`
 - `mean`, `std`
-- `eval_map_start_epoch`
+- `eval_map_start_epoch`, `eval_conf_threshold`
+- `patience`, `use_ema`, `ema_decay`
+- `tal_topk`, `tal_alpha`, `tal_beta`
 
 ---
 
@@ -416,16 +468,17 @@ Key parameters:
 
 ```text
 SWAP-Fighter/
-├── config.py          # Global configuration
-├── dataset.py         # YOLO-style dataset with letterbox, augmentation, Mosaic
-├── model.py           # Backbone, LightFPN, detection head, DetectFCOS
-├── train.py           # Training loop, logging, checkpointing, plotting
-├── infer.py           # Single-image PyTorch inference
-├── export.py          # ONNX exporter
-├── onnx_demo.py       # ONNX Runtime inference demo
-├── utils.py           # Losses, post-processing, NMS, mAP, letterbox
-├── README.md          # English README
-└── README.zh-CN.md    # Chinese README
+├── config.py             # Global configuration
+├── dataset.py            # YOLO-style dataset with letterbox, augmentation, Mosaic, MixUp, Copy-Paste
+├── model.py              # Backbone, LightFPN/BiFPN, DecoupledHead, DetectFCOS
+├── train.py              # Training loop, logging, checkpointing, plotting
+├── infer.py              # Single-image PyTorch inference
+├── export.py             # ONNX exporter
+├── onnx_demo.py          # ONNX Runtime inference demo
+├── simmim_pretrain.py    # SimMIM self-supervised pre-training
+├── utils.py              # Losses, post-processing, NMS, mAP, letterbox
+├── README.md             # English README
+└── README.zh-CN.md       # Chinese README
 ```
 
 ---
@@ -436,7 +489,7 @@ SWAP-Fighter/
 - For `fp16`, `GradScaler` is used automatically.
 - `bf16` requires Ampere or newer GPUs; otherwise it falls back to `fp16`.
 - Non-CUDA devices automatically use `fp32`.
-- OBB rotated NMS and OBB mAP require `shapely`.
+- OBB rotated NMS and OBB mAP are implemented in pure NumPy / PyTorch – no `shapely` required.
 - ONNX post-processing depends on correct `--strides`.
 
 ---
@@ -456,9 +509,9 @@ This project is licensed under the Apache 2.0 License – see the [LICENSE](LICE
 ## 🙏 Acknowledgements
 
 - [FCOS](https://github.com/tianzhi0549/FCOS) – original anchor-free detection idea.
+- [YOLOv8](https://github.com/ultralytics/ultralytics) – TAL assigner, decoupled head, and training pipeline inspiration.
 - [timm](https://github.com/huggingface/pytorch-image-models) – pre-trained backbone collection.
-- [torchmetrics](https://torchmetrics.readthedocs.io/) – mAP computation for horizontal boxes.
-- [shapely](https://shapely.readthedocs.io/) – rotated IoU and OBB evaluation.
+- [SimMIM](https://github.com/microsoft/SimMIM) – masked image modeling pre-training.
 
 ---
 

@@ -2,22 +2,26 @@
 
 **“换掉你的骨干，为更好的检测而战。”**
 
-SWAP-Fighter 是一个受 **FCOS** 和 **YOLOv8** 启发的模块化、无锚框目标检测框架。它允许你将不同的 `timm` 骨干网络接入统一的 Neck 和解耦多任务 Head，并同时支持：
+SWAP-Fighter 是一个受 **FCOS** 和 **YOLOv8** 启发的模块化、无锚框目标检测框架。它允许你将不同的 `timm` 骨干网络接入统一的 Neck 和解耦多任务 Head，并支持：
 
 - **`detect`**：水平框检测
 - **`obb`**：旋转框检测，带角度预测
+- **`multilabel`**：多标签图像分类
 
 > 中文名称：**接头霸王** —— 因为你可以随意“接”上任何你想要的骨干网络！
+
+**GitHub 仓库**：https://github.com/IntptrMax/SwapFighter
 
 ---
 
 ## ✨ 主要特点
 
 - **即插即用的骨干网络**：通过 `timm` 的 `features_only=True` 接入大量预训练模型。
-- **两种检测模式**
+- **三种任务模式**
   - `detect`：水平框
   - `obb`：旋转框 + 角度回归
-- **统一的无锚框检测头**
+  - `multilabel`：多标签分类
+- **统一的无锚框检测头**（用于 detect/obb）
   - **解耦头**：分类、回归、角度分别使用独立的卷积塔。
   - 分类：**Focal Loss** 风格（BCE + 目标分数归一化）。
   - 回归：
@@ -26,35 +30,39 @@ SWAP-Fighter 是一个受 **FCOS** 和 **YOLOv8** 启发的模块化、无锚框
   - 角度：
     - `sin_cos`：余弦损失 + 周期 L1 辅助损失
     - `direct`：周期 L1 损失
+- **多标签分类头**
+  - 池化：`gap`、`gem`、`attention`
+  - 分类头：`linear` 或 `mlp`
+  - 损失：`bce` 或 `asl`（Asymmetric Loss）
 - **Task-Aligned Assigner (TAL)** 正样本分配。
-  - 参数：`tal_topk`、`tal_alpha`、`tal_beta`。
 - **完整训练流程**
   - 精度：`fp32`、`fp16`、`bf16`
   - `fp16` 自动使用 `GradScaler`
   - Warmup + cosine / step / multistep / lambda / OneCycle 调度器
   - 梯度裁剪
-  - 分阶段冻结 / 解冻 Backbone
   - EMA（指数移动平均）
   - 早停（patience）
   - 支持断点恢复
 - **灵活的数据集支持**
-  - YOLO 风格目录结构
-  - `detect` 标签：`class cx cy w h`
-  - `obb` 标签：`class x1 y1 x2 y2 x3 y3 x4 y4`
-  - 两种标签格式可互相兼容读取
+  - detect/obb 使用 YOLO 风格目录结构
+  - multilabel 支持 txt 标签文件（id-list 和 one-hot 两种格式）
+  - multilabel 支持 HuggingFace datasets
 - **内置评估指标**
-  - `detect`：mAP@0.5、mAP@0.5:0.95、AR@100（自定义 YOLOv8 风格实现）
+  - `detect`：mAP@0.5、mAP@0.5:0.95、AR@100（YOLOv8 风格）
   - `obb`：基于 ProbIoU 的旋转 IoU mAP@0.5、mAP@0.5:0.95
+  - `multilabel`：mAP、CF1、OF1、EMR
+- **SimMIM 自监督预训练**
+  - 通过 `simmim_pretrain.py` 在自有无标注图像上预训练骨干网络。
+  - 生成的权重可直接被 SWAP-Fighter 的 `Backbone` 加载，**无需任何键名归一化**。
+  - 支持 Swin / ConvNeXt / ViT（含 DINOv2 / DINOv3 / Eva）/ MobileNet / EfficientNet / 通用 CNN。
 - **丰富的可视化与日志**
   - CSV 训练日志
   - 自动绘制训练曲线（`results.png`）
   - 自动创建 `runX` 输出目录
   - 单图推理自适应字体和颜色
 - **部署支持**
-  - 支持 `detect` 和 `obb` 的 ONNX 导出
-  - 提供 ONNX Runtime 推理示例
-- **SimMIM 自监督预训练**（`simmim_pretrain.py`）
-  - 生成的权重可直接被 SWAP-Fighter 的 Backbone 加载，无需任何归一化。
+  - 所有任务支持 ONNX 导出（raw 或 end2end）
+  - 通过 `infer.py --format onnx` 进行 ONNX Runtime 推理
 
 ---
 
@@ -90,8 +98,8 @@ Backbone 特征选择逻辑是自动的：
 ### 1. 安装
 
 ```bash
-git clone https://github.com/yourusername/SWAP-Fighter.git
-cd SWAP-Fighter
+git clone https://github.com/IntptrMax/SwapFighter.git
+cd SwapFighter
 pip install -r requirements.txt
 ```
 
@@ -109,6 +117,7 @@ pip install -r requirements.txt
 - onnx
 - onnxruntime
 - onnxsim / onnx-simplifier（可选，用于 `--simplify`）
+- datasets（可选，用于 HuggingFace 多标签数据集）
 
 > 不再需要 `shapely` 或 `torchmetrics` —— 评估和旋转 NMS 均使用纯 NumPy / PyTorch 实现。
 
@@ -116,7 +125,9 @@ pip install -r requirements.txt
 
 ### 2. 数据集准备
 
-数据集应遵循 YOLO 风格的目录结构：
+#### 2.1 水平检测（`task = detect`）和旋转检测（`task = obb`）
+
+使用 YOLO 风格目录结构：
 
 ```text
 datasets/
@@ -137,57 +148,85 @@ datasets/
             └── ...
 ```
 
-#### 水平检测标签（`mode = detect`）
-
-推荐格式：
+**水平检测标签（`detect`）：**
 
 ```text
 class_id cx cy w h
 ```
 
-所有值归一化到 `[0, 1]`。
+所有值归一化到 `[0, 1]`。数据加载器也兼容 YOLO OBB 9 列标签，并会将其转换为水平外接框。
 
-数据加载器也兼容 YOLO OBB 9 列标签，并会将其转换为水平外接框。
-
-#### 旋转检测标签（`mode = obb`）
-
-推荐格式：
+**旋转检测标签（`obb`）：**
 
 ```text
 class_id x1 y1 x2 y2 x3 y3 x4 y4
 ```
 
-所有值归一化到 `[0, 1]`。
+所有值归一化到 `[0, 1]`。数据加载器也兼容 5 列 YOLO 检测标签，并会将其转换为角度为 `0` 的轴对齐旋转框。
 
-数据加载器也兼容 5 列 YOLO 检测标签，并会将其转换为角度为 `0` 的轴对齐旋转框。
+在 `config.py` 中设置数据集根目录，或通过 `--data-root` 指定。
 
-在 `config.py` 中设置数据集根目录：
+#### 2.2 多标签分类（`task = multilabel`）
 
-```python
-data_root = './datasets/your_dataset'
+支持两种数据源：本地 txt 文件或 HuggingFace 数据集。
+
+**本地 txt 文件：**
+
+```text
+datasets/
+└── your_multilabel_dataset/
+    ├── train2017/          # 训练图像
+    │   ├── img1.jpg
+    │   └── ...
+    ├── val2017/            # 验证图像
+    │   ├── img2.jpg
+    │   └── ...
+    ├── train_labels.txt
+    └── val_labels.txt
 ```
 
-或通过命令行指定：
+`train_labels.txt` / `val_labels.txt` 每行支持两种格式：
 
-```bash
---data-root ./datasets/your_dataset
+- **新格式**：`filename\t[0, 14, 26]`（制表符分隔，类别 id 列表）
+- **旧格式**：`filename 0 0 1 0 1 ...`（空格分隔，长度为 `num_classes` 的 one-hot 向量）
+
+新格式示例：
+```text
+img1.jpg	[0, 14, 26]
+img2.jpg	[3]
+img3.jpg	[]
 ```
+
+**HuggingFace 数据集：**
+
+数据集必须包含 `image` 和 `labels` 字段，可选 `label_names` 用于类名。使用 `--hf-dataset`、`--hf-config`、`--hf-train-split`、`--hf-val-split` 指定。
+
+#### 2.3 SimMIM 预训练（无标注图像）
+
+SimMIM 预训练只需要一个无标注图像文件夹（递归扫描）：
+
+```text
+datasets/
+└── unlabeled_images/
+    ├── any_subdir/
+    │   ├── a.jpg
+    │   └── ...
+    └── b.png
+```
+
+支持的扩展名：`.jpg`、`.jpeg`、`.png`、`.bmp`（不区分大小写）。
 
 ---
 
 ### 3. 训练
 
-使用默认配置开始训练：
-
-```bash
-python train.py
-```
+训练脚本为 `train.py`，内部使用 `SF` API。
 
 #### 水平检测示例
 
 ```bash
 python train.py \
-    --mode detect \
+    --task detect \
     --data-root ./datasets/my_data \
     --backbone convnextv2_tiny \
     --img-size 640 \
@@ -196,61 +235,99 @@ python train.py \
     --precision fp16 \
     --optimizer adamw \
     --scheduler cosine \
-    --warmup-epochs 5 \
-    --freeze-epochs 5 \
-    --eval-map-start-epoch 10
+    --save-dir ./outputs
+```
+
+如需设置其他配置项，可在命令末尾追加 `key=value`：
+
+```bash
+python train.py \
+    --task detect \
+    --data-root ./datasets/my_data \
+    --backbone convnextv2_tiny \
+    --img-size 640 \
+    --batch-size 16 \
+    --epochs 100 \
+    --precision fp16 \
+    warmup_epochs=5 freeze_epochs=5 mosaic_prob=0.8
 ```
 
 #### 旋转检测示例
 
 ```bash
 python train.py \
-    --mode obb \
-    --angle-format sin_cos \
-    --angle-range pi \
+    --task obb \
     --data-root ./datasets/dota_like \
     --backbone convnextv2_tiny \
     --img-size 1024 \
     --batch-size 8 \
     --epochs 100 \
     --precision fp16 \
-    --angle-weight 2.0 \
-    --obb-reg-loss probiou
+    --angle-format sin_cos \
+    --angle-range pi \
+    --obb-reg-loss probiou \
+    --save-dir ./outputs
 ```
 
-> `angle_range` 在 `config.py` 中配置，可选 `pi` 或 `pi2`。  
-> `angle_format` 也可在 `config.py` 中设置，或用 `--angle-format` 覆盖。
+#### 多标签分类示例（本地 txt）
+
+```bash
+python train.py \
+    --task multilabel \
+    --data-root ./datasets/multilabel_data \
+    --train-labels train_labels.txt \
+    --val-labels val_labels.txt \
+    --train-img-subdir train2017 \
+    --val-img-subdir val2017 \
+    --num-classes 20 \
+    --backbone convnextv2_atto \
+    --img-size 224 \
+    --batch-size 64 \
+    --epochs 40 \
+    --lr 1e-3 \
+    --precision fp16 \
+    --save-dir ./outputs
+```
+
+#### 多标签分类示例（HuggingFace）
+
+```bash
+python train.py \
+    --task multilabel \
+    --hf-dataset my_dataset \
+    --num-classes 20 \
+    --backbone convnextv2_atto \
+    --img-size 224 \
+    --batch-size 64 \
+    --epochs 40 \
+    --lr 1e-3 \
+    --save-dir ./outputs
+```
 
 #### 关键训练选项
 
-- `--mode detect|obb`：选择水平框或旋转框检测。
-- `--angle-format sin_cos|direct`：OBB 角度编码方式。
-- `--angle-range pi|pi2`：OBB 角度范围。
+- `--task detect|obb|multilabel`：选择任务。
+- `--data-root`：数据集根目录。
+- `--backbone`：timm 模型名。
+- `--img-size`：输入图像尺寸。
+- `--batch-size`：批大小。
+- `--epochs`：训练轮数。
+- `--lr`：学习率。
 - `--precision fp32|fp16|bf16`：训练精度。
-- `--optimizer sgd|adamw`：优化器类型。
+- `--optimizer sgd|adamw`：优化器。
 - `--scheduler lambda|step|multistep|cosine|onecycle`：学习率调度器。
-- `--warmup-epochs N`：非 OneCycle 调度器的 warmup 轮数。
-- `--freeze-epochs N`：前 N 轮冻结 Backbone。
-- `--backbone-lr-scale S`：Backbone 学习率缩放系数（默认 0.1）。
-- `--eval-fp32`：验证损失强制 FP32，更稳定。
-- `--eval-map-start-epoch N`：从第 N 轮开始计算 mAP。
-- `--mosaic-prob P`：Mosaic 概率。
-- `--mosaic-disable-epoch N`：第 N 轮后禁用 Mosaic。
-- `--patience N`：早停耐心值（0 = 禁用）。
-- `--use-ema` / `--no-ema`：启用/禁用 EMA（默认启用）。
-- `--ema-decay D`：EMA 衰减率。
-- `--no-plot`：禁用训练曲线绘制。
-- `--resume path/to/checkpoint.pth`：从检查点恢复训练。
+- `--patience`：早停耐心值（0 = 禁用）。
+- `--resume`：从检查点恢复。
+- `--no-ema`：禁用 EMA（默认启用）。
+- `--save-dir`：输出目录。
 
-训练脚本会自动在 `--save-dir`（默认 `./outputs`）下创建新的 `runX` 目录，包含：
+其他配置项（如 `warmup_epochs`、`freeze_epochs`、`mosaic_prob`、`backbone_lr_scale`、`ema_decay`）可通过在命令末尾追加 `key=value` 覆盖。
 
+训练脚本会自动在 `--save-dir` 下创建新的 `runX` 目录，包含：
 ```text
 runX/
 ├── best.pth
 ├── last.pth
-├── final.pth
-├── final_ema.pth
-├── epoch_N.pth
 ├── training_log.csv
 ├── config.json
 └── results.png
@@ -258,28 +335,28 @@ runX/
 
 ---
 
-### 4. 单张图片推理
+### 4. 推理
 
-#### 水平框检测
+#### 水平检测（PyTorch）
 
 ```bash
 python infer.py \
+    --task detect \
+    --weights ./outputs/detect/run1/best.pth \
     --image path/to/image.jpg \
-    --weights ./outputs/run1/best.pth \
-    --mode detect \
     --conf 0.7 \
     --nms 0.3 \
     --output result.jpg \
     --class-names pill capsule tablet
 ```
 
-#### 旋转框检测
+#### 旋转检测（PyTorch）
 
 ```bash
 python infer.py \
+    --task obb \
+    --weights ./outputs/obb/run1/best.pth \
     --image path/to/image.jpg \
-    --weights ./outputs/run1/best.pth \
-    --mode obb \
     --angle-format sin_cos \
     --angle-range pi \
     --conf 0.5 \
@@ -287,9 +364,40 @@ python infer.py \
     --class-names plane ship vehicle
 ```
 
-可使用 `--output-txt` 将检测结果保存为文本文件。  
-可使用 `--output-json` 将检测结果保存为 JSON 文件。  
-可使用 `--no-show` 禁用显示窗口（无 GUI 环境）。
+#### 多标签分类（PyTorch）
+
+```bash
+python infer.py \
+    --task multilabel \
+    --weights ./outputs/multilabel/run1/best.pth \
+    --image path/to/image.jpg \
+    --threshold 0.5 \
+    --top-k 5 \
+    --output result.jpg
+```
+
+#### ONNX 推理
+
+使用 `--format onnx`，`--weights` 指向 `.onnx` 文件。
+
+```bash
+python infer.py \
+    --format onnx \
+    --weights model.onnx \
+    --image test.jpg \
+    --conf 0.7 \
+    --nms 0.3 \
+    --class-names pill capsule tablet
+```
+
+对于 OBB，还需传入 `--angle-format` 和 `--angle-range`。
+
+> 如果模型步长不是 `[8, 16, 32]`，请传入 `--img-size`，并确保 ONNX metadata 中包含正确的 strides。ONNX 推理器会优先从 metadata 读取。
+
+其他选项：
+- `--output-dir`：将多张图片结果保存到目录。
+- `--show`：显示结果窗口。
+- `--show-size`：窗口最大宽度。
 
 ---
 
@@ -297,83 +405,64 @@ python infer.py \
 
 将训练好的模型导出为 ONNX：
 
-#### 水平框检测
+#### 水平检测
 
 ```bash
 python export.py \
-    --weights ./outputs/run1/best.pth \
+    --weights ./outputs/detect/run1/best.pth \
     --output model.onnx \
-    --mode detect \
     --img-size 640 \
     --dynamic \
     --simplify
 ```
 
-#### 旋转框检测
+#### 旋转检测
 
 ```bash
 python export.py \
-    --weights ./outputs/run1/best.pth \
+    --weights ./outputs/obb/run1/best.pth \
     --output model_obb.onnx \
-    --mode obb \
-    --angle-format sin_cos \
-    --angle-range pi \
     --img-size 640 \
     --dynamic \
     --simplify
 ```
 
-导出输出：
+#### 多标签分类
 
-- `detect`
-  - `probs`：`(B, N, C)`，Sigmoid 概率
-  - `bboxes`：`(B, N, 4)`，归一化 `(cx, cy, w, h)`
-- `obb`
-  - `probs`：`(B, N, C)`，Sigmoid 概率
-  - `bboxes`：`(B, N, 4)`，归一化 `(cx, cy, w, h)`
-  - `angles`：`(B, N, 2)`
-    - `sin_cos`：`[sin, cos]`
-    - `direct`：`[angle, 0]`，第二维为占位
+```bash
+python export.py \
+    --weights ./outputs/multilabel/run1/best.pth \
+    --output model_cls.onnx \
+    --img-size 224 \
+    --dynamic \
+    --simplify
+```
 
-> OBB 导出时的 `angle_range` 从 `config.py` 读取，或通过 `--angle-range` 覆盖。
+#### 导出模式
+
+- **Raw 模式**（默认）：输出单个张量 `output0`。
+  - detect：形状 `(B, 4+nc, P)`，值 `[cx, cy, w, h, cls...]` 归一化到 `[0,1]`。
+  - obb：形状 `(B, 5+nc, P)`，值 `[cx, cy, w, h, angle, cls...]` 归一化。
+  - multilabel：输出 `logits`，形状 `(B, num_classes)`。
+- **End2end 模式**（`--end2end`，仅 detect/obb）：输出 `num_dets`、`boxes`、`scores`、`classes`。NMS 已固化。`--conf`、`--nms`、`--max-det` 控制固化的 NMS 参数。
+
+Metadata（backbone、img_size、mean、std、strides 等）会写入 ONNX 文件。
 
 ---
 
-### 6. ONNX 推理演示
+### 6. SimMIM 自监督预训练
 
-#### 水平框检测
+`simmim_pretrain.py` 实现了 SimMIM（Masked Image Modeling），可以在你自己的**无标注**图像上对骨干网络做自监督预训练。生成的 encoder 权重可以直接被 SWAP-Fighter 的 `Backbone`（以及 `MultiLabelClassifier` 在 `pretrained_source='simmim'` 时）加载，**无需任何键名重映射**。
 
-```bash
-python onnx_demo.py \
-    --model model.onnx \
-    --image test.jpg \
-    --mode detect \
-    --conf-threshold 0.7 \
-    --nms-threshold 0.3 \
-    --class-names pill capsule tablet
-```
+#### 工作原理
 
-#### 旋转框检测
+1. 在像素分辨率生成随机块掩码（默认 `mask_patch_size=32`，`mask_ratio=0.6`）。
+2. 掩码后的图像送入 timm 骨干网络（`features_only=True`）。
+3. 在 stem / patch_embed 之后立即注入 mask token。
+4. 一个轻量级线性解码器重建被掩码区域的像素值。
+5. 损失 = 仅在被掩码像素上的 L1 损失。
 
-```bash
-python onnx_demo.py \
-    --model model_obb.onnx \
-    --image test.jpg \
-    --mode obb \
-    --angle-format sin_cos \
-    --angle-range pi \
-    --conf-threshold 0.5 \
-    --nms-threshold 0.3 \
-    --class-names plane ship vehicle
-```
-
-> 重要：如果模型实际步长不是 `[8, 16, 32]`，请显式传入 `--strides`，确保 ONNX 后处理正确切分输出。
-
----
-
-### 7. SimMIM 自监督预训练
-
-SWAP-Fighter 包含 `simmim_pretrain.py`，可在无标注图像上对 Backbone 进行 SimMIM 自监督预训练，生成的权重可直接用于检测器训练。
+实现会自动识别内层 backbone、patch size、stage-1 通道数，从而适配 Swin / ConvNeXt / ViT（含 DINOv2 / DINOv3 / Eva）/ MobileNet / EfficientNet / 通用 CNN。
 
 #### 预训练
 
@@ -387,67 +476,84 @@ python simmim_pretrain.py \
     --epochs 100 \
     --batch-size 64 \
     --lr 1e-4 \
+    --weight-decay 0.05 \
+    --warmup-epochs 3 \
     --precision fp16 \
     --output ./simmim_pretrained/convnextv2_atto_simmim.pth
 ```
 
-#### 在训练中使用预训练权重
+#### 关键选项
+
+- `--data-dir`：无标注图像文件夹（递归扫描）。
+- `--backbone`：timm 模型名（必须与 `train.py` 中使用的一致）。
+- `--img-size`：预训练输入尺寸（默认 `224`）。
+- `--mask-patch-size`：掩码块像素大小（默认 `32`）。必须整除 `img_size`。
+- `--mask-ratio`：被掩码 patch 的比例（默认 `0.6`）。
+- `--pretrained` / `--no-pretrained`：是否从 timm ImageNet 权重开始（默认：使用 ImageNet 权重）。
+- `--epochs`、`--batch-size`、`--lr`、`--weight-decay`、`--warmup-epochs`。
+- `--grad-clip`：梯度裁剪范数（默认 `5.0`）。
+- `--accumulation-steps`：梯度累积，用于等效增大 batch size。
+- `--precision fp32|fp16|bf16`：AMP 精度。
+- `--output`：encoder state dict 保存路径（`.pth`）。
+
+#### 使用预训练权重训练检测/分类模型
+
+**用于 detect / obb：**
 
 ```bash
 python train.py \
-    --mode detect \
+    --task detect \
     --data-root ./datasets/my_data \
     --backbone convnextv2_atto \
     --pretrained-source simmim \
     --backbone-pretrained-path ./simmim_pretrained/convnextv2_atto_simmim.pth \
     --img-size 640 \
     --batch-size 16 \
-    --epochs 100
+    --epochs 100 \
+    --save-dir ./outputs
 ```
 
-保存的 state dict 与 `Backbone` 类完全兼容，无需任何键名归一化。
+**用于 multilabel：**
+
+```bash
+python train.py \
+    --task multilabel \
+    --data-root ./datasets/multilabel_data \
+    --train-labels train_labels.txt \
+    --val-labels val_labels.txt \
+    --num-classes 20 \
+    --backbone convnextv2_atto \
+    --pretrained-source simmim \
+    --backbone-pretrained-path ./simmim_pretrained/convnextv2_atto_simmim.pth \
+    --img-size 224 \
+    --batch-size 64 \
+    --epochs 40 \
+    --save-dir ./outputs
+```
+
+> 保存的 state dict 键名与 `Backbone` 类完全兼容 —— SWAP-Fighter 的加载器只会做标准的 `module.` / `encoder.` 前缀剥离，与 SimMIM 导出的键名完全匹配。
+
+#### 使用建议
+
+- 预训练和 `train.py` 中使用**相同的 `--backbone` 名**，否则键名不匹配。
+- 预训练的 `img-size` **不必**与下游 `img_size` 相同。常见配置是：预训练 `224`，检测 `640`（OBB 常用 `1024`）。
+- 对 ViT / DINOv2 / DINOv3 骨干，由于启用了 `dynamic_img_size=True`，下游不同尺寸输入不会出问题。
+- 如果显存不足，减小 `--batch-size` 并增大 `--accumulation-steps`。
 
 ---
 
-## 🧠 工作原理
+### 7. 配置说明
 
-1. **Backbone** 通过 `timm` 提取多尺度特征图。
-2. **LightFPN** 或 **BiFPN** 融合不同层级的特征。
-3. **解耦多任务 Head** 预测：
-   - 分类 logits
-   - 边界框回归（可选 DFL）
-   - OBB 模式下的角度
-4. **Task-Aligned Assigner (TAL)** 基于分类得分和 IoU 分配正样本。
-5. **损失函数**
-   - 分类：Focal Loss 风格（BCE + 目标分数归一化）
-   - `detect` 回归：CIoU + 可选 DFL
-   - `obb` 回归：CRIoU + ProbIoU（或 KLD）+ 可选 DFL
-   - 角度：周期 L1，或余弦 + 周期 L1
-6. **后处理**
-   - 置信度阈值
-   - `detect`：水平 NMS
-   - `obb`：基于 ProbIoU 的旋转 NMS
-7. **评估**
-   - `detect`：自定义 YOLOv8 风格 mAP
-   - `obb`：基于 ProbIoU 的旋转 mAP
-
-整个流程高度模块化：替换 Backbone 时，无需修改 Neck、Head、损失和后处理代码。
-
----
-
-## 🛠️ 配置说明
-
-所有全局超参数集中在 `config.py` 中，很多参数可通过命令行覆盖。
+所有全局超参数集中在 `swapfighter/config.py`。任务默认配置在 `swapfighter/tasks/*.py`。
 
 关键参数：
 
-- `mode`：`detect` 或 `obb`
+- `task`：`detect`、`obb`、`multilabel`
 - `data_root`、`train_split`、`val_split`、`num_classes`
 - `backbone_name`、`pretrained`、`img_size`
 - `neck_out_channels`、`head_num_convs`、`use_extra_conv`
 - `neck_type`、`neck_num_layers`
 - `head_type`、`head_norm_layer`、`head_act_layer`
-- `head_cls_num_convs`、`head_reg_num_convs`、`head_angle_num_convs`
 - `with_angle`、`angle_range`、`angle_format`
 - `reg_max`、`dfl_weight`
 - `obb_reg_loss`、`kld_weight`、`kld_tau`、`kld_fun`
@@ -461,6 +567,7 @@ python train.py \
 - `eval_map_start_epoch`、`eval_conf_threshold`
 - `patience`、`use_ema`、`ema_decay`
 - `tal_topk`、`tal_alpha`、`tal_beta`
+- `pool_type`、`head_type`、`loss`、`eval_threshold`（多标签分类）
 
 ---
 
@@ -468,17 +575,54 @@ python train.py \
 
 ```text
 SWAP-Fighter/
-├── config.py             # 全局配置
-├── dataset.py            # YOLO 风格数据集，含 Letterbox、增强、Mosaic、MixUp、Copy-Paste
-├── model.py              # Backbone、LightFPN/BiFPN、DecoupledHead、DetectFCOS
-├── train.py              # 训练循环、日志、检查点、绘图
-├── infer.py              # 单张图片 PyTorch 推理
-├── export.py             # ONNX 导出器
-├── onnx_demo.py          # ONNX Runtime 推理演示
-├── simmim_pretrain.py    # SimMIM 自监督预训练
-├── utils.py              # 损失函数、后处理、NMS、mAP、Letterbox
-├── README.md             # 英文说明
-└── README.zh-CN.md       # 中文说明
+├── swapfighter/
+│   ├── api.py                 # SF 类（统一入口）
+│   ├── config.py              # Config 类
+│   ├── tasks/                 # 任务注册与默认配置
+│   │   ├── __init__.py
+│   │   ├── detect.py
+│   │   ├── obb.py
+│   │   └── multilabel.py
+│   ├── engine/
+│   │   ├── base_trainer.py
+│   │   ├── base_predictor.py
+│   │   ├── trainers/
+│   │   │   ├── detect.py
+│   │   │   └── multilabel.py
+│   │   ├── predictors/
+│   │   │   ├── detect.py
+│   │   │   ├── multilabel.py
+│   │   │   └── onnx.py
+│   │   └── exporters/
+│   │       ├── onnx.py
+│   │       └── _onnx_impl.py
+│   ├── models/
+│   │   ├── backbones.py
+│   │   ├── necks/
+│   │   │   ├── lightfpn.py
+│   │   │   └── bifpn.py
+│   │   ├── heads/
+│   │   │   └── decoupled.py
+│   │   ├── detectors/
+│   │   │   └── detect_fcos.py
+│   │   └── classifiers/
+│   │       └── multi_label.py
+│   ├── datasets/
+│   │   ├── yolo_det.py
+│   │   └── cls_dataset.py
+│   └── utils/
+│       ├── box_ops.py
+│       ├── losses.py
+│       ├── metrics.py
+│       ├── postprocess.py
+│       └── logger.py
+├── train.py                     # 训练入口
+├── infer.py                     # 推理入口
+├── export.py                    # ONNX 导出入口
+├── simmim_pretrain.py           # SimMIM 自监督预训练
+├── requirements.txt
+├── README.md
+└── README.zh-CN.md
 ```
 
 ---
@@ -490,13 +634,15 @@ SWAP-Fighter/
 - `bf16` 需要 Ampere 或更新架构 GPU，否则自动回退到 `fp16`。
 - 非 CUDA 设备自动使用 `fp32`。
 - OBB 旋转 NMS 和 OBB mAP 均使用纯 NumPy / PyTorch 实现，无需安装 `shapely`。
-- ONNX 后处理依赖正确的 `--strides`。
+- ONNX 后处理依赖正确的 metadata（strides、img_size、mean、std）。
+- 多标签分类的类名可通过 `--class-names` 或 `class_names.txt` 文件提供。
+- SimMIM 预训练是**可选**的 —— 你也可以直接使用 timm ImageNet 权重。
 
 ---
 
 ## 🤝 贡献
 
-欢迎贡献！如有改进、错误修复或新的骨干网络支持，请提交 Issue 或 Pull Request。
+欢迎贡献！如有改进、错误修复或新的骨干网络支持，请到 https://github.com/IntptrMax/SwapFighter 提交 Issue 或 Pull Request。
 
 ---
 
@@ -511,7 +657,7 @@ SWAP-Fighter/
 - [FCOS](https://github.com/tianzhi0549/FCOS) – 原始无锚框检测思想。
 - [YOLOv8](https://github.com/ultralytics/ultralytics) – TAL 分配器、解耦头及训练流程灵感。
 - [timm](https://github.com/huggingface/pytorch-image-models) – 大量预训练骨干网络。
-- [SimMIM](https://github.com/microsoft/SimMIM) – 掩码图像建模预训练。
+- [SimMIM](https://github.com/microsoft/SimMIM) – 掩码图像建模预训练思想。
 
 ---
 

@@ -4,13 +4,9 @@ import numpy as np
 import torch
 
 LOG_SCALE_MIN = -4.0
-LOG_SCALE_MAX = 4.0
+LOG_SCALE_MAX = 6.0
 MIN_POS_PER_GT = 4
 
-
-# ============================================================
-# letterbox
-# ============================================================
 def letterbox(img, new_shape=(640, 640), color=(114, 114, 114), auto=False,
               scaleup=True, stride=32):
     shape = img.shape[:2]
@@ -33,10 +29,6 @@ def letterbox(img, new_shape=(640, 640), color=(114, 114, 114), auto=False,
                              cv2.BORDER_CONSTANT, value=color)
     return img, r, (left, top), shape
 
-
-# ============================================================
-# cxcywh + angle → 8 点 (torch)
-# ============================================================
 def cxcywh_angle_to_obb(cx, cy, w, h, angle):
     N = cx.shape[0]
     device = cx.device
@@ -61,12 +53,7 @@ def cxcywh_angle_to_obb(cx, cy, w, h, angle):
     obboxes = corners_final.reshape(N, 8)
     return torch.clamp(obboxes, 0, 1)
 
-
-# ============================================================
-# 8 点 → cxcywh + angle (numpy)
-# ============================================================
 def obb_xy8_to_cxcywh_angle_np(obboxes_8):
-    """(N, 8) → (N, 5) [cx, cy, w, h, angle]"""
     pts = obboxes_8.reshape(-1, 4, 2).astype(np.float32)
     cx = pts[:, :, 0].mean(axis=1)
     cy = pts[:, :, 1].mean(axis=1)
@@ -83,10 +70,6 @@ def obb_xy8_to_cxcywh_angle_np(obboxes_8):
                      np.arctan2(v2[:, 1], v2[:, 0]))
     return np.stack([cx, cy, w, h, angle], axis=1).astype(np.float32)
 
-
-# ============================================================
-# cxcywh+angle → 8 点 (numpy)
-# ============================================================
 def cxcywh_angle_to_obb_np(cx, cy, w, h, angle):
     N = cx.shape[0]
     half_w = w / 2
@@ -104,7 +87,7 @@ def cxcywh_angle_to_obb_np(cx, cy, w, h, angle):
         np.stack([-sin_a, cos_a], axis=1)
     ], axis=1)
 
-    corners_rot = np.einsum('nij,nkj->nki', rot, corners)
+    corners_rot = np.matmul(corners, rot)
     center = np.stack([cx, cy], axis=1)[:, None, :]
     corners_final = corners_rot + center
     return corners_final.reshape(N, 8).astype(np.float32)

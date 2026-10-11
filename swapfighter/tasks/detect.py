@@ -5,7 +5,6 @@ from ..engine.exporters.onnx import ONNXExporter
 from ..models.detectors.detect_fcos import build_detect_model
 from ..datasets.yolo_det import YOLODataset
 
-
 register_task(
     'detect',
     model=build_detect_model,
@@ -14,7 +13,6 @@ register_task(
     predictor=DetectPredictor,
     exporter=ONNXExporter,
     default_cfg=dict(
-        mode='detect',
         with_angle=False,
         angle_format=None,
         angle_range=None,
@@ -23,5 +21,7 @@ register_task(
         img_size=640,
         mean=[0.485, 0.456, 0.406],
         std=[0.229, 0.224, 0.225],
+        neck_out_channels=[64, 128, 256],
+        head_channels=128,
     ),
 )

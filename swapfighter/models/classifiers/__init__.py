@@ -1,9 +1,14 @@
 from .multi_label import (
     MultiLabelClassifier,
+    build_classifier,
     build_multilabel_classifier,
-    GeM, AttentionPooling,
+    GeM,
+    AttentionPooling,
 )
 __all__ = [
-    'MultiLabelClassifier', 'build_multilabel_classifier',
-    'GeM', 'AttentionPooling',
+    'MultiLabelClassifier',
+    'build_classifier',
+    'build_multilabel_classifier',
+    'GeM',
+    'AttentionPooling',
 ]

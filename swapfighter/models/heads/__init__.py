@@ -1,2 +1,4 @@
 from .decoupled import DecoupledHead, DecoupledBranch
-__all__ = ['DecoupledHead', 'DecoupledBranch']
+from .seg_decoupled import SegDecoupledHead, SegPrototypeBranch
+__all__ = ['DecoupledHead', 'DecoupledBranch', 
+           'MLDecoderHead', 'SegDecoupledHead', 'SegPrototypeBranch',]

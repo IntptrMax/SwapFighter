@@ -8,10 +8,6 @@ from .box_ops import (
     cxcywh_angle_to_obb, obb_xy8_to_cxcywh_angle_np, cxcywh_angle_to_obb_np,
 )
 
-
-# ============================================================
-# numpy ProbIoU
-# ============================================================
 def _batch_probiou_np(gt_obb, pred_obb, eps=1e-6):
     gt_w = np.maximum(gt_obb[:, 2], eps)
     gt_h = np.maximum(gt_obb[:, 3], eps)
@@ -49,10 +45,6 @@ def _batch_probiou_np(gt_obb, pred_obb, eps=1e-6):
     hd = np.sqrt(1.0 - np.exp(-bd) + eps)
     return 1.0 - hd
 
-
-# ============================================================
-# 旋转 NMS
-# ============================================================
 def rotated_nms(obboxes, scores, iou_threshold=0.5, labels=None):
     if len(obboxes) == 0:
         return np.array([], dtype=np.int64)
@@ -93,10 +85,6 @@ def rotated_nms(obboxes, scores, iou_threshold=0.5, labels=None):
     keep_all = sorted(keep_all, key=lambda x: -scores[x])
     return np.array(keep_all, dtype=np.int64)
 
-
-# ============================================================
-# 按类别分组 NMS（水平框）
-# ============================================================
 def _classwise_nms(boxes, scores, labels, nms_threshold):
     if boxes.numel() == 0:
         return torch.zeros(0, dtype=torch.long, device=boxes.device)
@@ -112,21 +100,22 @@ def _classwise_nms(boxes, scores, labels, nms_threshold):
     order = torch.argsort(scores[keep], descending=True)
     return keep[order]
 
-
-# ============================================================
-# 水平框后处理
-# ============================================================
 def post_process(cls_logits_list, reg_preds_list,
                  orig_w, orig_h, img_size, conf_threshold=0.5, nms_threshold=0.5,
                  strides=None, scale=None, pad_left=0, pad_top=0,
-                 reg_max=0):
+                 reg_max=0,
+                 return_indices=False):
     device = cls_logits_list[0].device
     num_levels = len(cls_logits_list)
     if strides is None:
-        strides = [img_size // cls_logits_list[i].shape[2] for i in range(num_levels)]
+        strides = [img_size // cls_logits_list[i].shape[2]
+                   for i in range(num_levels)]
 
     use_dfl = reg_max > 0
     all_boxes, all_scores, all_labels = [], [], []
+
+    origin_point = []
+    offset = 0
 
     for level_idx in range(num_levels):
         stride = strides[level_idx]
@@ -138,7 +127,13 @@ def post_process(cls_logits_list, reg_preds_list,
         max_scores, max_labels = torch.max(scores, dim=0)
         keep = max_scores > conf_threshold
         if not keep.any():
+            offset += H * W
             continue
+
+        y_keep, x_keep = torch.where(keep)
+        local_idx = y_keep * W + x_keep
+        origin_point.extend((offset + local_idx).cpu().tolist())
+        offset += H * W
 
         y_coords = torch.arange(H, device=device).float() * stride + stride / 2
         x_coords = torch.arange(W, device=device).float() * stride + stride / 2
@@ -173,6 +168,8 @@ def post_process(cls_logits_list, reg_preds_list,
         all_labels.append(labels_keep)
 
     if not all_boxes:
+        if return_indices:
+            return [], [], [], []
         return [], [], []
 
     boxes = torch.cat(all_boxes, dim=0)
@@ -194,16 +191,19 @@ def post_process(cls_logits_list, reg_preds_list,
     boxes[:, 3] = torch.clamp(boxes[:, 3], 0, orig_h)
 
     keep = _classwise_nms(boxes, scores, labels, nms_threshold)
-    boxes = boxes[keep].cpu().numpy()
-    scores = scores[keep].cpu().numpy()
-    labels = labels[keep].cpu().numpy()
+    keep_list = keep.cpu().tolist()
 
-    return boxes, scores, labels
+    boxes_np = boxes[keep].cpu().numpy()
+    scores_np = scores[keep].cpu().numpy()
+    labels_np = labels[keep].cpu().numpy()
 
+    if return_indices:
 
-# ============================================================
-# 旋转框后处理
-# ============================================================
+        origin_kept = [origin_point[i] for i in keep_list]
+        return boxes_np, scores_np, labels_np, origin_kept
+
+    return boxes_np, scores_np, labels_np
+
 def post_process_obb(cls_logits_list, reg_preds_list, angle_preds_list,
                      orig_w, orig_h, img_size, conf_threshold=0.5, nms_threshold=0.5,
                      strides=None, scale=None, pad_left=0, pad_top=0,
@@ -259,7 +259,6 @@ def post_process_obb(cls_logits_list, reg_preds_list, angle_preds_list,
             cy_local_pix = dy * stride
             w_pix = torch.exp(dw.clamp(LOG_SCALE_MIN, LOG_SCALE_MAX)) * stride
             h_pix = torch.exp(dh.clamp(LOG_SCALE_MIN, LOG_SCALE_MAX)) * stride
-
         size_mask = (
             (w_pix < MAX_ALLOWED_SIDE) & (h_pix < MAX_ALLOWED_SIDE) &
             (w_pix > MIN_ALLOWED_SIDE) & (h_pix > MIN_ALLOWED_SIDE)

@@ -2,7 +2,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-
 class BiFPNLayer(nn.Module):
     def __init__(self, channels, num_levels=3, epsilon=1e-4):
         super().__init__()
@@ -52,7 +51,6 @@ class BiFPNLayer(nn.Module):
             bu_outputs[i] = self.bu_convs[i - 1](fused)
 
         return bu_outputs
-
 
 class BiFPN(nn.Module):
     def __init__(self, in_channels_list, out_channels=256, num_layers=2):

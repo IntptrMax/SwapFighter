@@ -10,10 +10,6 @@ import torchvision.transforms as T
 
 from ..utils.box_ops import letterbox
 
-
-# ============================================================
-# 颜色增强
-# ============================================================
 class YOLOv8ColorAugment:
     def __init__(self, hsv_h=0.015, hsv_s=0.7, hsv_v=0.4,
                  blur_prob=0.01, median_blur_prob=0.01,
@@ -96,10 +92,6 @@ class YOLOv8ColorAugment:
         lab = cv2.merge((l, a, b))
         return cv2.cvtColor(lab, cv2.COLOR_LAB2RGB)
 
-
-# ============================================================
-# 几何变换
-# ============================================================
 class RandomPerspective:
     def __init__(self, degrees=0.0, translate=0.1, scale=0.5,
                  shear=0.0, perspective=0.0, img_size=640,
@@ -278,14 +270,10 @@ class RandomPerspective:
             x[:, 3] * (y[:, 0] - y[:, 2])
         )
 
-
-# ============================================================
-# 数据集
-# ============================================================
 class YOLODataset(Dataset):
     def __init__(self, root, img_size=640, split='train',
                  use_flip=True, use_color_aug=True,
-                 mean=[0, 0, 0], std=[1, 1, 1], mode='detect', angle_range='pi',
+                 mean=[0, 0, 0], std=[1, 1, 1], task='detect', angle_range='pi',
                  debug_vis=False,
                  mosaic_prob=0.0, mosaic_disable_epoch=None,
                  degrees=0.0, translate=0.1, scale=0.5,
@@ -302,7 +290,7 @@ class YOLODataset(Dataset):
         self.split = split
         self.use_flip = use_flip and split == 'train'
         self.use_color_aug = use_color_aug and split == 'train'
-        self.mode = mode
+        self.task = task
         self.angle_range = angle_range
         self.debug_vis = debug_vis
         self.mosaic_prob = mosaic_prob if split == 'train' else 0.0
@@ -325,7 +313,7 @@ class YOLODataset(Dataset):
         self.copy_paste_prob = copy_paste_prob if split == 'train' else 0.0
         self.copy_paste_max_paste = copy_paste_max_paste
 
-        if self.mode == 'obb':
+        if self.task == 'obb':
             if self.angle_range not in ('pi', 'pi2'):
                 raise ValueError(f"angle_range 必须为 pi/pi2")
         else:
@@ -376,7 +364,6 @@ class YOLODataset(Dataset):
     def __len__(self):
         return len(self.img_files)
 
-    # ------------------------------------------------------------------
     def __getitem__(self, idx):
         use_mosaic = (
             self.split == 'train'
@@ -418,7 +405,6 @@ class YOLODataset(Dataset):
 
         return img_tensor, targets
 
-    # ------------------------------------------------------------------
     def _load_single_as_numpy(self, idx):
         base_name = self.img_files[idx]
         img_path = self._find_image_path(base_name)
@@ -430,7 +416,7 @@ class YOLODataset(Dataset):
 
         label_path = os.path.join(self.label_dir, f'{base_name}.txt')
 
-        if self.mode == 'detect':
+        if self.task == 'detect':
             boxes, labels = self._load_detect_labels(label_path)
             obboxes = None
         else:
@@ -441,18 +427,18 @@ class YOLODataset(Dataset):
             img_rgb, new_shape=(self.img_size, self.img_size),
             auto=False, stride=32)
 
-        if self.mode == 'detect' and boxes is not None and len(boxes) > 0:
+        if self.task == 'detect' and boxes is not None and len(boxes) > 0:
             boxes = self._transform_detect_boxes(boxes, w0, h0, lb_scale, pad_left, pad_top)
-        elif self.mode == 'obb' and obboxes is not None and len(obboxes) > 0:
+        elif self.task == 'obb' and obboxes is not None and len(obboxes) > 0:
             obboxes = self._transform_obb_boxes(obboxes, w0, h0, lb_scale, pad_left, pad_top)
 
         targets = {
-            'mode': self.mode, 'scale': lb_scale,
+            'mode': self.task, 'scale': lb_scale,
             'pad_left': pad_left, 'pad_top': pad_top,
             'orig_size': (w0, h0), 'flip': False, 'flip_dir': None,
             'labels': labels if labels is not None else np.zeros((0,), dtype=np.int64),
         }
-        if self.mode == 'detect':
+        if self.task == 'detect':
             targets['boxes'] = boxes if boxes is not None else np.zeros((0, 4), dtype=np.float32)
         else:
             targets['obboxes'] = obboxes if obboxes is not None else np.zeros((0, 8), dtype=np.float32)
@@ -467,7 +453,7 @@ class YOLODataset(Dataset):
 
         if self.random_perspective is not None:
             img_padded, targets = self.random_perspective(img_padded, targets)
-            if self.mode == 'obb':
+            if self.task == 'obb':
                 obboxes_new = targets['obboxes']
                 if len(obboxes_new) > 0:
                     cxcywh, angles = self._compute_cxcywh_angle_from_obboxes(
@@ -481,7 +467,6 @@ class YOLODataset(Dataset):
         img_padded, targets = self._random_flip(img_padded, targets)
         return img_padded, targets
 
-    # ------------------------------------------------------------------
     def _load_mosaic_as_numpy(self, idx):
         s = self.img_size
         xc = int(random.uniform(0, 2 * s))
@@ -530,7 +515,7 @@ class YOLODataset(Dataset):
             mosaic_img[y1c:y2c, x1c:x2c] = img_resized[y1s:y2s, x1s:x2s]
             label_path = os.path.join(self.label_dir, f'{base_name}.txt')
 
-            if self.mode == 'detect':
+            if self.task == 'detect':
                 boxes, labels = self._load_detect_labels(label_path)
                 if len(boxes) == 0:
                     continue
@@ -608,14 +593,14 @@ class YOLODataset(Dataset):
             all_labels = np.zeros((0,), dtype=np.int64)
 
         targets = {
-            'mode': self.mode, 'scale': 1.0,
+            'mode': self.task, 'scale': 1.0,
             'pad_left': 0, 'pad_top': 0,
             'orig_size': (2 * s, 2 * s),
             'flip': False, 'flip_dir': None,
             'labels': all_labels,
         }
 
-        if self.mode == 'detect':
+        if self.task == 'detect':
             targets['boxes'] = (np.concatenate(all_boxes, axis=0)
                                 if len(all_boxes) > 0
                                 else np.zeros((0, 4), dtype=np.float32))
@@ -633,7 +618,7 @@ class YOLODataset(Dataset):
 
         if self.random_perspective is not None:
             mosaic_img, targets = self.random_perspective(mosaic_img, targets)
-            if self.mode == 'obb':
+            if self.task == 'obb':
                 obboxes_new = targets['obboxes']
                 if len(obboxes_new) > 0:
                     cxcywh, angles = self._compute_cxcywh_angle_from_obboxes(
@@ -649,7 +634,6 @@ class YOLODataset(Dataset):
         mosaic_img, targets = self._random_flip(mosaic_img, targets)
         return mosaic_img, targets
 
-    # ------------------------------------------------------------------
     def _apply_mixup(self, img, targets):
         if len(self.img_files) < 2:
             return img, targets
@@ -676,7 +660,6 @@ class YOLODataset(Dataset):
         })
         return img_mixed, targets_mixed
 
-    # ------------------------------------------------------------------
     def _apply_copy_paste(self, img, targets):
         if len(self.img_files) < 2:
             return img, targets
@@ -688,7 +671,7 @@ class YOLODataset(Dataset):
             src_img = cv2.resize(src_img, (img.shape[1], img.shape[0]),
                                  interpolation=cv2.INTER_LINEAR)
 
-        if self.mode == 'obb':
+        if self.task == 'obb':
             src_boxes = src_targets.get('obboxes', np.zeros((0, 8), dtype=np.float32))
         else:
             src_boxes = src_targets.get('boxes', np.zeros((0, 4), dtype=np.float32))
@@ -707,7 +690,7 @@ class YOLODataset(Dataset):
         H, W = img_out.shape[:2]
 
         for i in pick:
-            if self.mode == 'obb':
+            if self.task == 'obb':
                 obbox = src_boxes[i]
                 pts = (obbox.reshape(4, 2) * np.array([W, H], dtype=np.float32)).astype(np.int32)
                 mask = np.zeros((H, W), dtype=np.uint8)
@@ -734,11 +717,11 @@ class YOLODataset(Dataset):
             return img, targets
 
         pasted_targets = {
-            'mode': self.mode,
+            'mode': self.task,
             'labels': np.array(pasted_labels, dtype=np.int64) if pasted_labels
                       else np.zeros((0,), dtype=np.int64),
         }
-        if self.mode == 'obb':
+        if self.task == 'obb':
             pasted_targets['obboxes'] = np.array(pasted_boxes, dtype=np.float32).reshape(-1, 8)
             if len(pasted_targets['obboxes']) > 0:
                 cxcywh, angles = self._compute_cxcywh_angle_from_obboxes(
@@ -759,10 +742,9 @@ class YOLODataset(Dataset):
         })
         return img_out, merged
 
-    # ------------------------------------------------------------------
     def _merge_targets(self, t1, t2):
         merged = {
-            'mode': self.mode,
+            'mode': self.task,
             'labels': np.concatenate([
                 t1.get('labels', np.zeros((0,), dtype=np.int64)),
                 t2.get('labels', np.zeros((0,), dtype=np.int64)),
@@ -771,7 +753,7 @@ class YOLODataset(Dataset):
             'orig_size': t1.get('orig_size', (self.img_size, self.img_size)),
             'flip': False, 'flip_dir': None,
         }
-        if self.mode == 'detect':
+        if self.task == 'detect':
             merged['boxes'] = np.concatenate([
                 t1.get('boxes', np.zeros((0, 4), dtype=np.float32)),
                 t2.get('boxes', np.zeros((0, 4), dtype=np.float32)),
@@ -791,12 +773,11 @@ class YOLODataset(Dataset):
             merged['angles'] = angles
         return merged
 
-    # ------------------------------------------------------------------
     def _apply_hflip(self, img, targets):
         img = cv2.flip(img, 1)
         targets['flip'] = True
         targets['flip_dir'] = 'h'
-        if self.mode == 'detect':
+        if self.task == 'detect':
             targets['boxes'] = self._flip_detect_boxes_h(targets['boxes'])
         else:
             targets['obboxes'] = self._flip_obb_boxes_h(targets['obboxes'])
@@ -811,7 +792,7 @@ class YOLODataset(Dataset):
         img = cv2.flip(img, 0)
         targets['flip'] = True
         targets['flip_dir'] = 'v'
-        if self.mode == 'detect':
+        if self.task == 'detect':
             targets['boxes'] = self._flip_detect_boxes_v(targets['boxes'])
         else:
             targets['obboxes'] = self._flip_obb_boxes_v(targets['obboxes'])
@@ -829,7 +810,6 @@ class YOLODataset(Dataset):
             img, targets = self._apply_vflip(img, targets)
         return img, targets
 
-    # ------------------------------------------------------------------
     def _normalize_obb_angle(self, angle_rad, w, h):
         if self.angle_range == 'pi':
             angle_rad = angle_rad % np.pi
@@ -881,7 +861,6 @@ class YOLODataset(Dataset):
         return (np.array(cxcywh, dtype=np.float32),
                 np.array(angles, dtype=np.float32))
 
-    # ------------------------------------------------------------------
     def _find_image_path(self, base_name):
         for ext in ['.jpg', '.jpeg', '.png']:
             path = os.path.join(self.img_dir, f'{base_name}{ext}')

@@ -11,30 +11,25 @@ from ...utils.box_ops import letterbox
 from ...utils.postprocess import post_process, post_process_obb
 from ...utils.logger import LINE, LINE_EQ, _title, _kv, suppress_stdout
 
-
 CLASS_COLORS = [
     (0, 200, 0), (255, 100, 0), (0, 100, 255), (200, 200, 0),
     (200, 0, 200), (0, 200, 200), (100, 100, 255), (255, 0, 100),
     (100, 255, 100), (255, 200, 100),
 ]
 
-
 def _get_class_color(label):
     return CLASS_COLORS[int(label) % len(CLASS_COLORS)]
-
 
 def _bool_en(b):
     return "yes" if b else "no"
 
-
 _IMG_EXTS = ('.jpg', '.jpeg', '.png', '.bmp', '.webp', '.tif', '.tiff')
-
 
 class DetectPredictor(BasePredictor):
 
     def __init__(self, cfg_dict, weights=None):
         super().__init__(cfg_dict, weights)
-        # 由 build_model() 填充
+
         self._weights_meta = {}
         self._load_status = 'N/A'
         self._applied_overrides = []
@@ -75,12 +70,10 @@ class DetectPredictor(BasePredictor):
 
         return model.eval().to(self.device)
 
-    # ------------------------------------------------------------------
     def run(self, source):
         if self.model is None:
             self.model = self.build_model()
 
-        # ---------- 收集图片路径 ----------
         if os.path.isdir(source):
             images = sorted(
                 os.path.join(source, f) for f in os.listdir(source)
@@ -91,13 +84,11 @@ class DetectPredictor(BasePredictor):
         else:
             images = [source]
 
-        # ---------- 打印 Header ----------
         if len(images) == 1:
             self._print_header(images[0])
         else:
             self._print_header_multi(source, len(images))
 
-        # ---------- 逐图推理 ----------
         results = []
         for img_path in images:
             r = self._predict_one(img_path)
@@ -106,7 +97,6 @@ class DetectPredictor(BasePredictor):
             if len(images) == 1:
                 self._print_result(r)
 
-        # ---------- 多图汇总 ----------
         if len(images) > 1:
             print()
             print(LINE_EQ)
@@ -125,9 +115,6 @@ class DetectPredictor(BasePredictor):
 
         return results
 
-    # ------------------------------------------------------------------
-    # Header 打印
-    # ------------------------------------------------------------------
     def _print_header(self, image_path):
         cfg = self.cfg
 
@@ -171,7 +158,6 @@ class DetectPredictor(BasePredictor):
         print()
         print(LINE_EQ)
 
-    # ------------------------------------------------------------------
     def _print_weights_block(self):
         _title("Weights")
         _kv("Path", self.weights)
@@ -191,11 +177,15 @@ class DetectPredictor(BasePredictor):
     def _print_model_block(self):
         cfg = self.cfg
         _title("Model")
-        mode_str = ("OBB (rotated bbox)" if cfg.mode == 'obb'
-                    else "Detect (axis-aligned bbox)")
-        _kv("Mode", mode_str)
 
-        # ---------- Backbone 细节（从已构建的模型里取） ----------
+        if cfg.task == 'obb':
+            task_str = "OBB (rotated bbox)"
+        elif cfg.task == 'segment':
+            task_str = "Segment (instance segmentation)"
+        else:
+            task_str = "Detect (axis-aligned bbox)"
+        _kv("Task", task_str)
+
         if hasattr(self.model, 'backbone'):
             bb = self.model.backbone
             src = getattr(bb, 'resolved_source', 'N/A')
@@ -222,7 +212,7 @@ class DetectPredictor(BasePredictor):
                     f"norm={getattr(cfg, 'head_norm_layer', 'group')}, "
                     f"act={getattr(cfg, 'head_act_layer', 'silu')})")
 
-        if cfg.mode == 'obb':
+        if cfg.task == 'obb':
             _kv("Task", f"cls={cfg.num_classes}, reg=4, angle=2 "
                         f"({getattr(cfg, 'angle_format', 'sin_cos')})")
         else:
@@ -235,14 +225,13 @@ class DetectPredictor(BasePredictor):
         cfg = self.cfg
         _title("Inference")
         _kv("Conf Threshold", f"{cfg.conf_threshold:.3f}")
-        if cfg.mode == 'obb':
+        if cfg.task == 'obb':
             nms = getattr(cfg, 'obb_nms_threshold', None) or cfg.nms_threshold
             _kv("NMS Threshold", f"{nms:.3f}")
             _kv("Angle Range", getattr(cfg, 'angle_range', 'pi'))
         else:
             _kv("NMS Threshold", f"{cfg.nms_threshold:.3f}")
 
-    # ------------------------------------------------------------------
     @torch.no_grad()
     def _predict_one(self, image_path):
         cfg = self.cfg
@@ -261,7 +250,7 @@ class DetectPredictor(BasePredictor):
             transforms.Normalize(mean=cfg.mean, std=cfg.std),
         ])(Image.fromarray(img_padded)).unsqueeze(0).to(self.device)
 
-        if cfg.mode == 'detect':
+        if cfg.task == 'detect':
             cls_l, reg_l = self.model(x)
             boxes, scores, labels = post_process(
                 cls_l, reg_l, orig_w, orig_h, cfg.img_size,
@@ -292,7 +281,7 @@ class DetectPredictor(BasePredictor):
         return {
             'image': image_path,
             'orig_size': (orig_w, orig_h),
-            'mode': cfg.mode,
+            'mode': cfg.task,
             'boxes': boxes,
             'obboxes': obboxes,
             'scores': scores,
@@ -300,9 +289,6 @@ class DetectPredictor(BasePredictor):
             'img_vis': img_vis,
         }
 
-    # ------------------------------------------------------------------
-    # Result 打印
-    # ------------------------------------------------------------------
     def _print_result(self, r):
         cfg = self.cfg
         boxes = r.get('boxes')
@@ -324,7 +310,6 @@ class DetectPredictor(BasePredictor):
             print(LINE_EQ)
             return
 
-        # ---------- 类别分布 ----------
         from collections import Counter
         class_names = self.class_names
         if class_names:
@@ -338,12 +323,11 @@ class DetectPredictor(BasePredictor):
                 bar = "█" * min(int(cnt / max_cnt * 20), 20)
                 print(f"    {name:<20}  {cnt:>4d}  {bar}")
 
-        # ---------- 检测详情（按分数排序） ----------
         top_k = getattr(cfg, 'top_k', 20)
         order = np.argsort(-np.array(scores))[:top_k]
         print()
 
-        if cfg.mode == 'detect':
+        if cfg.task == 'detect':
             print(f"  {'#':>4}  {'Label':<16}  {'Score':>7}  "
                   f"{'Geometry (x1,y1,x2,y2)':<40}")
             print("  " + "─" * 76)
@@ -388,7 +372,6 @@ class DetectPredictor(BasePredictor):
             return self.class_names[int(label)]
         return str(int(label))
 
-    # ------------------------------------------------------------------
     def _draw(self, img_rgb, boxes, obboxes, scores, labels):
         vis = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
         font_scale = max(0.4, min(1.8, min(vis.shape[:2]) / 800.0))

@@ -4,7 +4,6 @@ from contextlib import contextmanager
 LINE = "─" * 64
 LINE_EQ = "═" * 64
 
-
 @contextmanager
 def suppress_stdout():
     import io
@@ -15,10 +14,8 @@ def suppress_stdout():
     finally:
         sys.stdout = old
 
-
 def _title(text):
     print(f"\n  [{text}]")
-
 
 def _kv(key, value, indent=4, total_width=40):
     prefix = " " * indent
@@ -26,7 +23,6 @@ def _kv(key, value, indent=4, total_width=40):
     pad_len = max(2, total_width - len(label))
     dots = " " + "." * pad_len + " "
     print(f"{prefix}{label}{dots} {value}")
-
 
 def _bool_en(b):
     return "yes" if b else "no"

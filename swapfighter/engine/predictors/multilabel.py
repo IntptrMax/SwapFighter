@@ -9,12 +9,10 @@ import torchvision.transforms as T
 from ..base_predictor import BasePredictor
 from ...utils.logger import LINE, LINE_EQ, _title, _kv, suppress_stdout
 
-
 _IMG_EXTS = ('.jpg', '.jpeg', '.png', '.bmp', '.webp', '.tif', '.tiff')
 DEFAULT_MEAN = [0.485, 0.456, 0.406]
 DEFAULT_STD = [0.229, 0.224, 0.225]
 DEFAULT_RESIZE_RATIO = 1.14
-
 
 _INTERP_MAP = {
     'bicubic': T.InterpolationMode.BICUBIC,
@@ -22,7 +20,6 @@ _INTERP_MAP = {
     'nearest': T.InterpolationMode.NEAREST,
     'lanczos': T.InterpolationMode.LANCZOS,
 }
-
 
 def _build_transform(img_size, mean, std, resize_ratio=1.14,
                      interpolation='bicubic'):
@@ -34,7 +31,6 @@ def _build_transform(img_size, mean, std, resize_ratio=1.14,
         T.Normalize(mean=mean, std=std),
     ])
 
-
 class MultiLabelPredictor(BasePredictor):
 
     def __init__(self, cfg_dict, weights=None):
@@ -44,12 +40,10 @@ class MultiLabelPredictor(BasePredictor):
         self._has_meta = False
         self._info = {}
 
-    # ------------------------------------------------------------------
     def build_model(self):
         from ...tasks import get_task
         task_def = get_task(self.cfg.task)
 
-        # 屏蔽 MultiLabelClassifier / timm 初始化时的散乱打印
         with suppress_stdout():
             model = task_def['model'](self.cfg)
 
@@ -78,7 +72,6 @@ class MultiLabelPredictor(BasePredictor):
                 parts.append(f'unexpected {len(real_unexpected)}')
             self._load_status = 'WARN: ' + ', '.join(parts)
 
-        # ---------- 从 meta 里恢复信息 ----------
         arch = meta.get('architecture', {}) or {}
         preprocess = meta.get('preprocess', {}) or {}
         inference = meta.get('inference', {}) or {}
@@ -137,12 +130,10 @@ class MultiLabelPredictor(BasePredictor):
 
         return model.eval().to(self.device)
 
-    # ------------------------------------------------------------------
     def run(self, source):
         if self.model is None:
             self.model = self.build_model()
 
-        # ---------- 收集图片 ----------
         if os.path.isdir(source):
             images = sorted(
                 os.path.join(source, f) for f in os.listdir(source)
@@ -153,11 +144,9 @@ class MultiLabelPredictor(BasePredictor):
         else:
             images = [source]
 
-        # ---------- 类名 + 阈值 ----------
         class_names, class_names_src = self._resolve_class_names()
         threshold, threshold_src = self._resolve_threshold()
 
-        # ---------- Header ----------
         if len(images) == 1:
             self._print_header_single(images[0], threshold, threshold_src,
                                        class_names, class_names_src)
@@ -166,7 +155,6 @@ class MultiLabelPredictor(BasePredictor):
                                       threshold_src, class_names,
                                       class_names_src)
 
-        # ---------- 预处理 ----------
         transform = _build_transform(
             self._info['img_size'],
             mean=self._info['mean'],
@@ -175,7 +163,6 @@ class MultiLabelPredictor(BasePredictor):
             interpolation=self._info['interpolation'],
         )
 
-        # ---------- 逐图推理 ----------
         results = []
         for img_path in images:
             r = self._predict_one(img_path, transform, threshold, class_names)
@@ -199,7 +186,6 @@ class MultiLabelPredictor(BasePredictor):
                 except Exception as e:
                     print(f"  JSON 保存失败: {e}")
 
-        # ---------- 多图汇总 ----------
         if len(images) > 1:
             print()
             print(LINE_EQ)
@@ -219,31 +205,29 @@ class MultiLabelPredictor(BasePredictor):
 
         return results
 
-    # ------------------------------------------------------------------
     def _resolve_class_names(self):
-        # 1. CLI 传入（cfg.class_names）
+
         if self.class_names:
             return list(self.class_names), 'CLI'
-        # 2. ckpt.meta
+
         meta_names = self._info.get('class_names')
         if meta_names and len(meta_names) == self._info['num_classes']:
             return list(meta_names), 'checkpoint.meta'
-        # 3. 占位
+
         n = self._info['num_classes']
         return [f'cls_{i}' for i in range(n)], 'placeholder'
 
     def _resolve_threshold(self):
-        # CLI 传了非默认值 → CLI
+
         eval_threshold = getattr(self.cfg, 'eval_threshold', None)
         if eval_threshold is not None and float(eval_threshold) != 0.5:
             return float(eval_threshold), 'CLI'
-        # meta.best
+
         if self._info['best_threshold'] is not None:
             return float(self._info['best_threshold']), 'meta.best'
-        # meta.default
+
         return float(self._info['default_threshold']), 'meta.default'
 
-    # ------------------------------------------------------------------
     @torch.no_grad()
     def _predict_one(self, image_path, transform, threshold, class_names):
         img = Image.open(image_path).convert('RGB')
@@ -295,9 +279,6 @@ class MultiLabelPredictor(BasePredictor):
                           for p in r['positives']],
         }
 
-    # ------------------------------------------------------------------
-    # Header 打印
-    # ------------------------------------------------------------------
     def _print_header_single(self, image_path, threshold, threshold_src,
                               class_names, class_names_src):
         try:
@@ -403,9 +384,6 @@ class MultiLabelPredictor(BasePredictor):
             _kv("Class Names",
                 f"{preview}{' ...' if len(class_names) > 5 else ''}")
 
-    # ------------------------------------------------------------------
-    # Result 打印
-    # ------------------------------------------------------------------
     def _print_result(self, r, threshold, class_names):
         probs = r['probs']
         name = os.path.basename(r['image'])
@@ -438,7 +416,6 @@ class MultiLabelPredictor(BasePredictor):
             print("  Output Files:")
             _kv("Image", self.output_image, indent=4)
 
-    # ------------------------------------------------------------------
     def _draw(self, img, probs, class_names, threshold, top_k):
         img_bgr = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
         order = np.argsort(-probs)

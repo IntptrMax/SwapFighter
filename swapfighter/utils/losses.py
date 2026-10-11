@@ -4,19 +4,23 @@ import torch.nn.functional as F
 
 from .box_ops import LOG_SCALE_MIN, LOG_SCALE_MAX
 
+def _grad_zero(ref):
+    if ref is None:
+        return torch.zeros((), dtype=torch.float32, requires_grad=True)
+    if not isinstance(ref, torch.Tensor) or ref.numel() == 0:
+        return torch.zeros((), dtype=torch.float32, requires_grad=True)
 
-# ============================================================
-# DFL
-# ============================================================
+    return ref.nan_to_num(0.0, posinf=0.0, neginf=0.0).sum() * 0.0
+
 def dfl_decode_distances(reg_logits, reg_max):
     probs = reg_logits.softmax(dim=-1)
-    idx = torch.arange(reg_max + 1, device=reg_logits.device, dtype=probs.dtype)
+    idx = torch.arange(reg_max + 1, device=reg_logits.device,
+                       dtype=probs.dtype)
     return (probs * idx).sum(dim=-1)
-
 
 def dfl_loss(pred_logits, target_distances, reg_max):
     if pred_logits.numel() == 0:
-        return torch.tensor(0.0, device=pred_logits.device, dtype=torch.float32)
+        return _grad_zero(pred_logits)
 
     target_distances = target_distances.clamp(0.0, reg_max - 0.01)
     tl = target_distances.floor().long().clamp(0, reg_max - 1)
@@ -36,15 +40,11 @@ def dfl_loss(pred_logits, target_distances, reg_max):
     )
     return loss.mean()
 
-
-# ============================================================
-# CIoU
-# ============================================================
 def ciou_loss(pred_xyxy, gt_xyxy, eps=1e-7):
     pred_xyxy = pred_xyxy.float()
     gt_xyxy = gt_xyxy.float()
     if pred_xyxy.numel() == 0 or gt_xyxy.numel() == 0:
-        return torch.tensor(0.0, device=pred_xyxy.device, dtype=torch.float32)
+        return _grad_zero(pred_xyxy)
 
     px_cx = (pred_xyxy[:, 0] + pred_xyxy[:, 2]) / 2
     px_cy = (pred_xyxy[:, 1] + pred_xyxy[:, 3]) / 2
@@ -73,21 +73,20 @@ def ciou_loss(pred_xyxy, gt_xyxy, eps=1e-7):
     union = area_pred + area_gt - inter + eps
     iou = inter / union
 
-    v = (4 / (math.pi ** 2)) * (torch.atan(gt_w / gt_h) - torch.atan(pred_w / pred_h)).pow(2)
+    v = (4 / (math.pi ** 2)) * (
+        torch.atan(gt_w / gt_h) - torch.atan(pred_w / pred_h)
+    ).pow(2)
     alpha = v / (v - iou + 1 + eps)
 
     ciou = iou - center_dist2 / c2 - alpha * v
     loss = (1.0 - ciou).clamp(min=0).mean()
     if torch.isnan(loss) or torch.isinf(loss):
-        return torch.tensor(0.0, device=pred_xyxy.device, dtype=torch.float32)
+        return _grad_zero(pred_xyxy)
     return loss
 
-
-# ============================================================
-# Focal Loss（保留兼容）
-# ============================================================
 def focal_loss(pred_logits, targets, alpha=0.25, gamma=2.0, reduction='mean'):
-    bce = F.binary_cross_entropy_with_logits(pred_logits, targets, reduction='none')
+    bce = F.binary_cross_entropy_with_logits(pred_logits, targets,
+                                             reduction='none')
     pt = torch.exp(-bce)
     focal = alpha * (1 - pt).pow(gamma) * bce
     if reduction == 'mean':
@@ -96,10 +95,6 @@ def focal_loss(pred_logits, targets, alpha=0.25, gamma=2.0, reduction='mean'):
         return focal.sum()
     return focal
 
-
-# ============================================================
-# 角度损失
-# ============================================================
 def periodic_l1_loss(pred_angle, target_angle, angle_range='pi'):
     pred_angle = pred_angle.float()
     target_angle = target_angle.float()
@@ -108,24 +103,20 @@ def periodic_l1_loss(pred_angle, target_angle, angle_range='pi'):
     diff = torch.min(diff, math.pi - diff)
     return diff.abs().mean()
 
-
 def cosine_angle_loss(pred_sin_cos, target_sin_cos):
     pred_norm = F.normalize(pred_sin_cos, dim=1)
     target_norm = F.normalize(target_sin_cos, dim=1)
     return (1.0 - (pred_norm * target_norm).sum(dim=1)).mean()
 
-
-# ============================================================
-# ProbIoU
-# ============================================================
 def _get_covariance_matrix(boxes):
     gbbs = torch.cat((boxes[:, 2:4].pow(2) / 12, boxes[:, 4:]), dim=-1)
     a, b, c = gbbs.split(1, dim=-1)
     cos = c.cos()
     sin = c.sin()
     cos2, sin2 = cos.pow(2), sin.pow(2)
-    return a * cos2 + b * sin2, a * sin2 + b * cos2, (a - b) * cos * sin
-
+    return (a * cos2 + b * sin2,
+            a * sin2 + b * cos2,
+            (a - b) * cos * sin)
 
 def probiou(obb1, obb2, eps=1e-6):
     obb1 = obb1.float()
@@ -141,7 +132,8 @@ def probiou(obb1, obb2, eps=1e-6):
 
     denom = ((a1 + a2) * (b1 + b2) - (c1 + c2).pow(2)).clamp(min=eps)
 
-    t1 = (((a1 + a2) * (y1 - y2).pow(2) + (b1 + b2) * (x1 - x2).pow(2)) / (denom + eps)) * 0.25
+    t1 = (((a1 + a2) * (y1 - y2).pow(2)
+           + (b1 + b2) * (x1 - x2).pow(2)) / (denom + eps)) * 0.25
     t2 = (((c1 + c2) * (x2 - x1) * (y1 - y2)) / (denom + eps)) * 0.5
 
     log_arg = denom / (
@@ -155,28 +147,33 @@ def probiou(obb1, obb2, eps=1e-6):
     hd = (1.0 - (-bd).exp() + eps).sqrt()
     return 1 - hd
 
-
 def probiou_loss(pred_obb, target_obb):
+    if pred_obb.numel() == 0 or target_obb.numel() == 0:
+        return _grad_zero(pred_obb)
     iou = probiou(pred_obb, target_obb)
-    return (1.0 - iou).clamp(min=0).mean()
-
+    loss = (1.0 - iou).clamp(min=0).mean()
+    if torch.isnan(loss) or torch.isinf(loss):
+        return _grad_zero(pred_obb)
+    return loss
 
 def center_l1_loss(pred_obb, target_obb):
+    if pred_obb.numel() == 0:
+        return _grad_zero(pred_obb)
     return (pred_obb[:, :2] - target_obb[:, :2]).abs().mean()
 
-
-# ============================================================
-# CRIoU
-# ============================================================
 def criou_loss(pred_bbox, target_bbox, eps=1e-7):
     pred_bbox = pred_bbox.float()
     target_bbox = target_bbox.float()
 
+    if pred_bbox.numel() == 0 or target_bbox.numel() == 0:
+        return _grad_zero(pred_bbox)
+
     if torch.isnan(pred_bbox).any() or torch.isnan(target_bbox).any():
-        return torch.tensor(0.0, device=pred_bbox.device, dtype=torch.float32)
+        return _grad_zero(pred_bbox)
 
     pred_cx, pred_cy, pred_w, pred_h, pred_angle = pred_bbox.unbind(dim=1)
-    target_cx, target_cy, target_w, target_h, target_angle = target_bbox.unbind(dim=1)
+    target_cx, target_cy, target_w, target_h, target_angle = \
+        target_bbox.unbind(dim=1)
 
     pred_w = torch.clamp(pred_w, min=eps)
     pred_h = torch.clamp(pred_h, min=eps)
@@ -190,24 +187,23 @@ def criou_loss(pred_bbox, target_bbox, eps=1e-7):
 
     iou_r = probiou(pred_bbox, target_bbox)
 
-    center_dist_sq = (pred_cx - target_cx).pow(2) + (pred_cy - target_cy).pow(2)
+    center_dist_sq = (pred_cx - target_cx).pow(2) + \
+                     (pred_cy - target_cy).pow(2)
     min_x = torch.min(pred_x1, target_x1); min_y = torch.min(pred_y1, target_y1)
     max_x = torch.max(pred_x2, target_x2); max_y = torch.max(pred_y2, target_y2)
     c = torch.sqrt((max_x - min_x).pow(2) + (max_y - min_y).pow(2) + eps)
 
-    v = (4 / (math.pi ** 2)) * (torch.atan(target_w / target_h) - torch.atan(pred_w / pred_h)).pow(2)
+    v = (4 / (math.pi ** 2)) * (
+        torch.atan(target_w / target_h) - torch.atan(pred_w / pred_h)
+    ).pow(2)
     alpha = v / (v - iou_r + (1 + eps))
     criou = iou_r - (center_dist_sq / (c.pow(2) + eps)) - alpha * v
 
     loss = (1.0 - criou).clamp(min=0).mean()
     if torch.isnan(loss) or torch.isinf(loss):
-        return torch.tensor(0.0, device=pred_bbox.device, dtype=torch.float32)
+        return _grad_zero(pred_bbox)
     return loss
 
-
-# ============================================================
-# KLD
-# ============================================================
 def _xywha_to_gaussian(cx, cy, w, h, angle, eps=1e-7):
     cos_a = torch.cos(angle)
     sin_a = torch.sin(angle)
@@ -224,18 +220,19 @@ def _xywha_to_gaussian(cx, cy, w, h, angle, eps=1e-7):
     mu = torch.stack([cx, cy], dim=1)
     return mu, sigma
 
-
 def kld_loss(pred_obb, target_obb, tau=1.0, fun='log1p', sqrt=False, eps=1e-7):
     if pred_obb.numel() == 0 or target_obb.numel() == 0:
-        return torch.tensor(0.0, device=pred_obb.device, dtype=torch.float32)
+        return _grad_zero(pred_obb)
 
     pred_obb = pred_obb.float()
     target_obb = target_obb.float()
 
     mu_p, sigma_p = _xywha_to_gaussian(
-        pred_obb[:, 0], pred_obb[:, 1], pred_obb[:, 2], pred_obb[:, 3], pred_obb[:, 4])
+        pred_obb[:, 0], pred_obb[:, 1], pred_obb[:, 2], pred_obb[:, 3],
+        pred_obb[:, 4])
     mu_t, sigma_t = _xywha_to_gaussian(
-        target_obb[:, 0], target_obb[:, 1], target_obb[:, 2], target_obb[:, 3], target_obb[:, 4])
+        target_obb[:, 0], target_obb[:, 1], target_obb[:, 2], target_obb[:, 3],
+        target_obb[:, 4])
 
     eye = eps * torch.eye(2, device=sigma_t.device).unsqueeze(0)
     sigma_t_inv = torch.inverse(sigma_t + eye)
@@ -264,13 +261,9 @@ def kld_loss(pred_obb, target_obb, tau=1.0, fun='log1p', sqrt=False, eps=1e-7):
 
     loss = kld.mean()
     if torch.isnan(loss) or torch.isinf(loss):
-        return torch.tensor(0.0, device=pred_obb.device, dtype=torch.float32)
+        return _grad_zero(pred_obb)
     return loss
 
-
-# ============================================================
-# Batch ProbIoU（训练用）
-# ============================================================
 def _batch_probiou(gt_obb, pred_obb, eps=1e-6, chunk_size=128):
     device = gt_obb.device
     N_gt = gt_obb.shape[0]
@@ -308,7 +301,8 @@ def _batch_probiou(gt_obb, pred_obb, eps=1e-6, chunk_size=128):
         t1 = ((a_sum * dy.pow(2) + b_sum * dx.pow(2)) / denom) * 0.25
         t2 = -(c_sum * dx * dy / denom) * 0.5
 
-        log_arg = (denom / (4 * (gab[:, None] * pab[None, sl]).sqrt() + eps)).clamp(min=eps)
+        log_arg = (denom / (4 * (gab[:, None] * pab[None, sl]).sqrt() + eps)
+                   ).clamp(min=eps)
         t3 = log_arg.log() * 0.5
 
         bd = (t1 + t2 + t3).clamp(min=eps, max=20.0)
@@ -316,7 +310,6 @@ def _batch_probiou(gt_obb, pred_obb, eps=1e-6, chunk_size=128):
         iou[:, sl] = 1.0 - hd
 
     return iou
-
 
 def _batch_bbox_iou(gt_boxes, pred_boxes, eps=1e-6):
     lt = torch.max(gt_boxes[:, None, :2], pred_boxes[None, :, :2])
@@ -328,25 +321,21 @@ def _batch_bbox_iou(gt_boxes, pred_boxes, eps=1e-6):
     union = a1[:, None] + a2[None, :] - inter
     return inter / (union + eps)
 
-
-# ============================================================
-# FCOS 总损失（detect + obb）
-# ============================================================
-# ============================================================
-# FCOS 总损失（detect + obb）—— 支持 return_parts 拆分展示
-# ============================================================
-def compute_fcos_loss(cls_logits_list, reg_preds_list, targets, strides, device, img_size,
+def compute_fcos_loss(cls_logits_list, reg_preds_list, targets, strides, device,
+                      img_size,
                       cls_weight=1.0, reg_weight=1.0, angle_weight=1.0,
                       dfl_weight=1.5,
-                      mode='detect', angle_format='sin_cos', angle_preds_list=None,
+                      task='detect', angle_format='sin_cos',
+                      angle_preds_list=None,
                       angle_range='pi',
                       tal_topk=13, tal_alpha=1.0, tal_beta=6.0,
                       reg_max=16,
                       kld_weight=1.0, kld_tau=1.0, kld_fun='log1p',
                       obb_reg_loss='probiou',
-                      return_parts=False):
-    if mode == 'obb' and angle_preds_list is None:
-        raise ValueError("OBB mode requires angle_preds_list")
+                      return_parts=False,
+                      return_pos_idx=False):
+    if task == 'obb' and angle_preds_list is None:
+        raise ValueError("OBB task requires angle_preds_list")
 
     use_dfl = (reg_max > 0)
     reg_channels = 4 * (reg_max + 1) if use_dfl else 4
@@ -360,7 +349,6 @@ def compute_fcos_loss(cls_logits_list, reg_preds_list, targets, strides, device,
     B = cls_logits_list[0].shape[0]
     C = cls_logits_list[0].shape[1]
 
-    # ---------- 拼接所有 level ----------
     all_grids, all_cls, all_regs, all_angles, all_strides = [], [], [], [], []
     offset = 0
 
@@ -382,7 +370,8 @@ def compute_fcos_loss(cls_logits_list, reg_preds_list, targets, strides, device,
 
         if angle_preds_list is not None:
             A = angle_preds_list[l].shape[1]
-            all_angles.append(angle_preds_list[l].permute(0, 2, 3, 1).reshape(B, P_l, A))
+            all_angles.append(
+                angle_preds_list[l].permute(0, 2, 3, 1).reshape(B, P_l, A))
 
         all_strides.append(torch.full((P_l,), float(stride), device=device))
         offset += P_l
@@ -395,7 +384,6 @@ def compute_fcos_loss(cls_logits_list, reg_preds_list, targets, strides, device,
     if len(all_angles) > 0:
         all_angles = torch.cat(all_angles, dim=1)
 
-    # ---------- GT 拼接 ----------
     gt_lens_t = torch.tensor([targets[b]['labels'].shape[0] for b in range(B)],
                              device=device, dtype=torch.long)
     gt_offsets = torch.zeros(B, device=device, dtype=torch.long)
@@ -408,23 +396,29 @@ def compute_fcos_loss(cls_logits_list, reg_preds_list, targets, strides, device,
     else:
         all_gt_labels = torch.zeros(0, dtype=torch.long, device=device)
 
-    if mode == 'detect':
+    if task == 'detect':
         if gt_lens_t.sum() > 0:
             all_gt_boxes = torch.cat(
-                [targets[b]['boxes'].float() * img_size for b in range(B)], dim=0)
+                [targets[b]['boxes'].float() * img_size for b in range(B)],
+                dim=0)
         else:
             all_gt_boxes = torch.zeros(0, 4, device=device)
     else:
         if gt_lens_t.sum() > 0:
             all_gt_cxcywh = torch.cat(
-                [targets[b]['cxcywh'].float() * img_size for b in range(B)], dim=0)
+                [targets[b]['cxcywh'].float() * img_size for b in range(B)],
+                dim=0)
             all_gt_angle = torch.cat(
                 [targets[b]['angles'].float() for b in range(B)], dim=0)
         else:
             all_gt_cxcywh = torch.zeros(0, 4, device=device)
             all_gt_angle = torch.zeros(0, device=device)
 
-    # ---------- 解码所有预测 ----------
+    pos_batch = torch.zeros(0, dtype=torch.long, device=device)
+    pos_point = torch.zeros(0, dtype=torch.long, device=device)
+    pos_gt = torch.zeros(0, dtype=torch.long, device=device)
+    N_pos = 0
+
     with torch.no_grad():
         grid_x_1d = all_grids[:, 0][None, :]
         grid_y_1d = all_grids[:, 1][None, :]
@@ -439,7 +433,7 @@ def compute_fcos_loss(cls_logits_list, reg_preds_list, targets, strides, device,
             w_stride = l_d + r_d
             h_stride = t_d + b_d
 
-            if mode == 'obb':
+            if task == 'obb':
                 pred_angle = (torch.atan2(all_angles[..., 0], all_angles[..., 1])
                               if angle_format == 'sin_cos' else all_angles[..., 0])
                 cos_a = torch.cos(pred_angle); sin_a = torch.sin(pred_angle)
@@ -449,7 +443,8 @@ def compute_fcos_loss(cls_logits_list, reg_preds_list, targets, strides, device,
                 pred_cy = grid_y_1d + cx_local_pix * sin_a + cy_local_pix * cos_a
                 pred_w = w_stride * strides_1d
                 pred_h = h_stride * strides_1d
-                pred_obb_all = torch.stack([pred_cx, pred_cy, pred_w, pred_h, pred_angle], dim=-1)
+                pred_obb_all = torch.stack(
+                    [pred_cx, pred_cy, pred_w, pred_h, pred_angle], dim=-1)
             else:
                 pred_cx = grid_x_1d + cx_local_stride * strides_1d
                 pred_cy = grid_y_1d + cy_local_stride * strides_1d
@@ -467,10 +462,11 @@ def compute_fcos_loss(cls_logits_list, reg_preds_list, targets, strides, device,
             pred_w = torch.exp(dw) * strides_1d
             pred_h = torch.exp(dh) * strides_1d
 
-            if mode == 'obb':
+            if task == 'obb':
                 pred_angle = (torch.atan2(all_angles[..., 0], all_angles[..., 1])
                               if angle_format == 'sin_cos' else all_angles[..., 0])
-                pred_obb_all = torch.stack([pred_cx, pred_cy, pred_w, pred_h, pred_angle], dim=-1)
+                pred_obb_all = torch.stack(
+                    [pred_cx, pred_cy, pred_w, pred_h, pred_angle], dim=-1)
             else:
                 pred_xyxy_all = torch.stack([
                     pred_cx - pred_w / 2, pred_cy - pred_h / 2,
@@ -478,7 +474,6 @@ def compute_fcos_loss(cls_logits_list, reg_preds_list, targets, strides, device,
 
         cls_scores_all = torch.sigmoid(all_cls)
 
-        # ---------- TAL 分配 ----------
         pos_batch_list, pos_point_list, pos_gt_list = [], [], []
 
         for batch_idx in range(B):
@@ -488,12 +483,13 @@ def compute_fcos_loss(cls_logits_list, reg_preds_list, targets, strides, device,
             b_start = int(gt_offsets[batch_idx].item())
             b_end = b_start + n_gt
 
-            if mode == 'obb':
+            if task == 'obb':
                 gt_cxcywh_b = all_gt_cxcywh[b_start:b_end]
                 gt_angle_b = all_gt_angle[b_start:b_end]
                 dx_ = all_grids[:, 0][None, :] - gt_cxcywh_b[:, 0:1]
                 dy_ = all_grids[:, 1][None, :] - gt_cxcywh_b[:, 1:2]
-                gc = torch.cos(gt_angle_b)[:, None]; gs = torch.sin(gt_angle_b)[:, None]
+                gc = torch.cos(gt_angle_b)[:, None]
+                gs = torch.sin(gt_angle_b)[:, None]
                 u = dx_ * gc + dy_ * gs
                 v = -dx_ * gs + dy_ * gc
                 half_w = gt_cxcywh_b[:, 2:3] * 0.5
@@ -521,7 +517,8 @@ def compute_fcos_loss(cls_logits_list, reg_preds_list, targets, strides, device,
             k = min(tal_topk, P_total)
             topk_vals, topk_idx = score_all.topk(k, dim=1)
 
-            gt_ids_flat = torch.arange(n_gt, device=device).unsqueeze(1).expand(-1, k).reshape(-1)
+            gt_ids_flat = torch.arange(n_gt, device=device).unsqueeze(1).expand(
+                -1, k).reshape(-1)
             point_ids_flat = topk_idx.reshape(-1)
             scores_flat = topk_vals.reshape(-1)
 
@@ -537,7 +534,8 @@ def compute_fcos_loss(cls_logits_list, reg_preds_list, targets, strides, device,
             if valid_gt.numel() == 0:
                 continue
 
-            pos_batch_list.append(torch.full_like(valid_gt, batch_idx, dtype=torch.long))
+            pos_batch_list.append(
+                torch.full_like(valid_gt, batch_idx, dtype=torch.long))
             pos_point_list.append(valid_point)
             pos_gt_list.append(valid_gt)
 
@@ -546,11 +544,14 @@ def compute_fcos_loss(cls_logits_list, reg_preds_list, targets, strides, device,
             pos_point = torch.cat(pos_point_list, dim=0)
             pos_gt = torch.cat(pos_gt_list, dim=0)
             N_pos = pos_point.numel()
-        else:
-            pos_batch = torch.zeros(0, dtype=torch.long, device=device)
-            pos_point = torch.zeros(0, dtype=torch.long, device=device)
-            pos_gt = torch.zeros(0, dtype=torch.long, device=device)
-            N_pos = 0
+
+        MAX_POS_PER_BATCH = 15000
+        if N_pos > MAX_POS_PER_BATCH:
+            keep_idx = torch.randperm(N_pos, device=device)[:MAX_POS_PER_BATCH]
+            pos_batch = pos_batch[keep_idx]
+            pos_point = pos_point[keep_idx]
+            pos_gt = pos_gt[keep_idx]
+            N_pos = MAX_POS_PER_BATCH
 
         cls_targets_all = torch.zeros((B, P_total, C), device=device)
         if N_pos > 0:
@@ -558,22 +559,22 @@ def compute_fcos_loss(cls_logits_list, reg_preds_list, targets, strides, device,
             pos_labels = all_gt_labels[global_gt_idx]
             cls_targets_all[pos_batch, pos_point, pos_labels] = 1.0
 
-    # ---------- 分类损失 ----------
     cls_logits_flat = torch.clamp(all_cls.reshape(-1, C), min=-20, max=20)
     cls_targets_flat = cls_targets_all.reshape(-1, C)
 
-    bce = F.binary_cross_entropy_with_logits(cls_logits_flat, cls_targets_flat, reduction='none')
+    bce = F.binary_cross_entropy_with_logits(
+        cls_logits_flat, cls_targets_flat, reduction='none')
     target_scores_sum = cls_targets_flat.sum().clamp(min=1.0)
     cls_loss = bce.sum() / target_scores_sum
 
     if torch.isnan(cls_loss) or torch.isinf(cls_loss):
-        cls_loss = torch.tensor(0.0, device=device, dtype=torch.float32)
+        cls_loss = _grad_zero(all_cls)
 
-    # ---------- 回归 / 角度损失 ----------
-    reg_loss = torch.tensor(0.0, device=device, dtype=torch.float32)
-    angle_loss = torch.tensor(0.0, device=device, dtype=torch.float32)
-    box_loss_part = torch.tensor(0.0, device=device, dtype=torch.float32)
-    dfl_loss_part = torch.tensor(0.0, device=device, dtype=torch.float32)
+    _anchor = all_cls if isinstance(all_cls, torch.Tensor) else None
+    reg_loss = _grad_zero(_anchor)
+    angle_loss = _grad_zero(_anchor)
+    box_loss_part = _grad_zero(_anchor)
+    dfl_loss_part = _grad_zero(_anchor)
 
     if N_pos > 0:
         pos_stride = all_strides[pos_point]
@@ -582,9 +583,10 @@ def compute_fcos_loss(cls_logits_list, reg_preds_list, targets, strides, device,
         global_gt_idx = gt_offsets[pos_batch] + pos_gt
 
         if use_dfl:
-            pos_reg_logits = all_regs.view(B, P_total, 4, reg_max + 1)[pos_batch, pos_point]
+            pos_reg_logits = all_regs.view(
+                B, P_total, 4, reg_max + 1)[pos_batch, pos_point]
 
-            if mode == 'obb':
+            if task == 'obb':
                 pos_gt_cxcywh = all_gt_cxcywh[global_gt_idx]
                 pos_gt_angle = all_gt_angle[global_gt_idx]
                 gt_cx, gt_cy, gt_w, gt_h = pos_gt_cxcywh.unbind(-1)
@@ -599,7 +601,9 @@ def compute_fcos_loss(cls_logits_list, reg_preds_list, targets, strides, device,
                 t_gt = (gt_h / 2 - cy_local) / pos_stride
                 r_gt = (gt_w / 2 + cx_local) / pos_stride
                 b_gt = (gt_h / 2 + cy_local) / pos_stride
-                target_distances = torch.stack([l_gt, t_gt, r_gt, b_gt], dim=-1).clamp(0.0, float(reg_max))
+                target_distances = torch.stack(
+                    [l_gt, t_gt, r_gt, b_gt], dim=-1
+                ).clamp(0.0, float(reg_max))
 
                 l_dfl = dfl_loss(pos_reg_logits, target_distances, reg_max)
                 dfl_loss_part = l_dfl
@@ -612,43 +616,58 @@ def compute_fcos_loss(cls_logits_list, reg_preds_list, targets, strides, device,
                 h_pix = (t_p + b_p) * pos_stride
 
                 pos_angle_reg = all_angles[pos_batch, pos_point]
-                pos_pred_angle = (torch.atan2(pos_angle_reg[:, 0], pos_angle_reg[:, 1])
-                                  if angle_format == 'sin_cos' else pos_angle_reg[:, 0])
+                pos_pred_angle = (torch.atan2(pos_angle_reg[:, 0],
+                                              pos_angle_reg[:, 1])
+                                  if angle_format == 'sin_cos'
+                                  else pos_angle_reg[:, 0])
 
-                cos_pa = torch.cos(pos_pred_angle); sin_pa = torch.sin(pos_pred_angle)
+                cos_pa = torch.cos(pos_pred_angle)
+                sin_pa = torch.sin(pos_pred_angle)
                 pred_cx = pos_grid_x + cx_local_pix * cos_pa - cy_local_pix * sin_pa
                 pred_cy = pos_grid_y + cx_local_pix * sin_pa + cy_local_pix * cos_pa
 
-                pred_obb_pos = torch.stack([pred_cx, pred_cy, w_pix, h_pix, pos_pred_angle], dim=1)
-                gt_obb_pos = torch.cat([pos_gt_cxcywh, pos_gt_angle.unsqueeze(1)], dim=1)
+                pred_obb_pos = torch.stack(
+                    [pred_cx, pred_cy, w_pix, h_pix, pos_pred_angle], dim=1)
+                gt_obb_pos = torch.cat(
+                    [pos_gt_cxcywh, pos_gt_angle.unsqueeze(1)], dim=1)
 
                 if obb_reg_loss == 'kld':
-                    l_kld = kld_loss(pred_obb_pos, gt_obb_pos, tau=kld_tau, fun=kld_fun)
+                    l_kld = kld_loss(pred_obb_pos, gt_obb_pos,
+                                     tau=kld_tau, fun=kld_fun)
                     box_loss_part = kld_weight * l_kld
-                    reg_loss = box_loss_part + dfl_weight * l_dfl
                 else:
                     l_criou = criou_loss(pred_obb_pos, gt_obb_pos)
                     l_probiou = probiou_loss(pred_obb_pos, gt_obb_pos)
                     box_loss_part = l_criou + 0.5 * l_probiou
-                    reg_loss = box_loss_part + dfl_weight * l_dfl
+
+                reg_loss = box_loss_part + dfl_weight * dfl_loss_part
 
                 if angle_format == 'sin_cos':
-                    tgt_sc = torch.stack([torch.sin(pos_gt_angle), torch.cos(pos_gt_angle)], dim=1)
+                    tgt_sc = torch.stack(
+                        [torch.sin(pos_gt_angle), torch.cos(pos_gt_angle)],
+                        dim=1)
                     cos_loss = cosine_angle_loss(pos_angle_reg, tgt_sc)
-                    aux = periodic_l1_loss(pos_pred_angle, pos_gt_angle, angle_range)
+                    aux = periodic_l1_loss(pos_pred_angle, pos_gt_angle,
+                                           angle_range)
                     angle_loss = cos_loss + 0.5 * aux
                 else:
-                    angle_loss = periodic_l1_loss(pos_pred_angle, pos_gt_angle, angle_range)
+                    angle_loss = periodic_l1_loss(pos_pred_angle, pos_gt_angle,
+                                                  angle_range)
             else:
                 pos_gt_boxes = all_gt_boxes[global_gt_idx]
                 gt_x1 = pos_gt_boxes[:, 0]; gt_y1 = pos_gt_boxes[:, 1]
                 gt_x2 = pos_gt_boxes[:, 2]; gt_y2 = pos_gt_boxes[:, 3]
 
-                l_target = ((pos_grid_x - gt_x1) / pos_stride).clamp(0.0, float(reg_max))
-                t_target = ((pos_grid_y - gt_y1) / pos_stride).clamp(0.0, float(reg_max))
-                r_target = ((gt_x2 - pos_grid_x) / pos_stride).clamp(0.0, float(reg_max))
-                b_target = ((gt_y2 - pos_grid_y) / pos_stride).clamp(0.0, float(reg_max))
-                target_distances = torch.stack([l_target, t_target, r_target, b_target], dim=-1)
+                l_target = ((pos_grid_x - gt_x1) / pos_stride).clamp(
+                    0.0, float(reg_max))
+                t_target = ((pos_grid_y - gt_y1) / pos_stride).clamp(
+                    0.0, float(reg_max))
+                r_target = ((gt_x2 - pos_grid_x) / pos_stride).clamp(
+                    0.0, float(reg_max))
+                b_target = ((gt_y2 - pos_grid_y) / pos_stride).clamp(
+                    0.0, float(reg_max))
+                target_distances = torch.stack(
+                    [l_target, t_target, r_target, b_target], dim=-1)
 
                 l_dfl = dfl_loss(pos_reg_logits, target_distances, reg_max)
                 dfl_loss_part = l_dfl
@@ -668,21 +687,28 @@ def compute_fcos_loss(cls_logits_list, reg_preds_list, targets, strides, device,
             pos_reg = all_regs[pos_batch, pos_point]
             pos_cx = pos_grid_x + pos_reg[:, 0] * pos_stride
             pos_cy = pos_grid_y + pos_reg[:, 1] * pos_stride
-            pos_w = torch.exp(pos_reg[:, 2].clamp(LOG_SCALE_MIN, LOG_SCALE_MAX)) * pos_stride
-            pos_h = torch.exp(pos_reg[:, 3].clamp(LOG_SCALE_MIN, LOG_SCALE_MAX)) * pos_stride
+            pos_w = torch.exp(pos_reg[:, 2].clamp(LOG_SCALE_MIN, LOG_SCALE_MAX)
+                              ) * pos_stride
+            pos_h = torch.exp(pos_reg[:, 3].clamp(LOG_SCALE_MIN, LOG_SCALE_MAX)
+                              ) * pos_stride
 
-            if mode == 'obb':
+            if task == 'obb':
                 pos_gt_cxcywh = all_gt_cxcywh[global_gt_idx]
                 pos_gt_angle = all_gt_angle[global_gt_idx]
                 pos_angle_reg = all_angles[pos_batch, pos_point]
-                pos_pred_angle = (torch.atan2(pos_angle_reg[:, 0], pos_angle_reg[:, 1])
-                                  if angle_format == 'sin_cos' else pos_angle_reg[:, 0])
+                pos_pred_angle = (torch.atan2(pos_angle_reg[:, 0],
+                                              pos_angle_reg[:, 1])
+                                  if angle_format == 'sin_cos'
+                                  else pos_angle_reg[:, 0])
 
-                pred_obb_pos = torch.stack([pos_cx, pos_cy, pos_w, pos_h, pos_pred_angle], dim=1)
-                gt_obb_pos = torch.cat([pos_gt_cxcywh, pos_gt_angle.unsqueeze(1)], dim=1)
+                pred_obb_pos = torch.stack(
+                    [pos_cx, pos_cy, pos_w, pos_h, pos_pred_angle], dim=1)
+                gt_obb_pos = torch.cat(
+                    [pos_gt_cxcywh, pos_gt_angle.unsqueeze(1)], dim=1)
 
                 if obb_reg_loss == 'kld':
-                    l_kld = kld_loss(pred_obb_pos, gt_obb_pos, tau=kld_tau, fun=kld_fun)
+                    l_kld = kld_loss(pred_obb_pos, gt_obb_pos,
+                                     tau=kld_tau, fun=kld_fun)
                     box_loss_part = kld_weight * l_kld
                     reg_loss = box_loss_part
                 else:
@@ -692,12 +718,16 @@ def compute_fcos_loss(cls_logits_list, reg_preds_list, targets, strides, device,
                     reg_loss = box_loss_part
 
                 if angle_format == 'sin_cos':
-                    tgt_sc = torch.stack([torch.sin(pos_gt_angle), torch.cos(pos_gt_angle)], dim=1)
+                    tgt_sc = torch.stack(
+                        [torch.sin(pos_gt_angle), torch.cos(pos_gt_angle)],
+                        dim=1)
                     cos_loss = cosine_angle_loss(pos_angle_reg, tgt_sc)
-                    aux = periodic_l1_loss(pos_pred_angle, pos_gt_angle, angle_range)
+                    aux = periodic_l1_loss(pos_pred_angle, pos_gt_angle,
+                                           angle_range)
                     angle_loss = cos_loss + 0.5 * aux
                 else:
-                    angle_loss = periodic_l1_loss(pos_pred_angle, pos_gt_angle, angle_range)
+                    angle_loss = periodic_l1_loss(pos_pred_angle, pos_gt_angle,
+                                                  angle_range)
             else:
                 pred_xyxy_pos = torch.stack([
                     pos_cx - pos_w / 2, pos_cy - pos_h / 2,
@@ -707,20 +737,31 @@ def compute_fcos_loss(cls_logits_list, reg_preds_list, targets, strides, device,
                 reg_loss = box_loss_part
 
         if torch.isnan(reg_loss) or torch.isinf(reg_loss):
-            reg_loss = torch.tensor(0.0, device=device, dtype=torch.float32)
+            reg_loss = _grad_zero(_anchor)
             box_loss_part = reg_loss
             dfl_loss_part = reg_loss
         if torch.isnan(angle_loss) or torch.isinf(angle_loss):
-            angle_loss = torch.tensor(0.0, device=device, dtype=torch.float32)
+            angle_loss = _grad_zero(_anchor)
 
-    total_loss = cls_weight * cls_loss + reg_weight * reg_loss + angle_weight * angle_loss
+    total_loss = (cls_weight * cls_loss
+                  + reg_weight * box_loss_part
+                  + dfl_weight * dfl_loss_part
+                  + angle_weight * angle_loss)
+
+    if not torch.isfinite(total_loss):
+        total_loss = _grad_zero(_anchor)
 
     if return_parts:
-        return {
+        parts = {
             'total': total_loss,
             'cls': cls_loss,
             'box': box_loss_part,
             'dfl': dfl_loss_part,
             'angle': angle_loss,
         }
+        if return_pos_idx:
+            parts['_pos_batch'] = pos_batch
+            parts['_pos_point'] = pos_point
+            parts['_pos_gt'] = pos_gt
+        return parts
     return total_loss

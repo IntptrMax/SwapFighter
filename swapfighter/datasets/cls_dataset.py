@@ -8,37 +8,23 @@ from torch.utils.data import Dataset
 import torchvision.transforms as T
 
 try:
-    from datasets import Dataset as HFDataset  # noqa
-    from datasets import DatasetDict as HFDatasetDict  # noqa
+    from datasets import Dataset as HFDataset
+    from datasets import DatasetDict as HFDatasetDict
     HAS_HF = True
 except ImportError:
     HAS_HF = False
     HFDataset = None
     HFDatasetDict = None
 
-
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
 
-# ============================================================
-# ★ 标签行解析器：同时兼容新旧两种格式
-# ============================================================
 def _parse_label_line(line, num_classes):
-    """
-    解析一行标签。
 
-    返回 (fname, onehot) 或 None（无法解析）。
-
-    支持：
-        - 新格式：filename\\t[0, 14, 26]
-        - 新格式：filename [0, 14, 26]      （兼容空格分隔）
-        - 旧格式：filename 0 0 1 0 1 ...    （C 个 one-hot 值）
-    """
     line = line.strip()
     if not line:
         return None
 
-    # ---------- 分离文件名与标签字符串 ----------
     if '\t' in line:
         fname, label_str = line.split('\t', 1)
     else:
@@ -50,7 +36,6 @@ def _parse_label_line(line, num_classes):
     fname = fname.lstrip('\ufeff').strip()
     label_str = label_str.strip()
 
-    # ---------- 新格式：[0, 14, 26] 或 [] ----------
     if label_str.startswith('[') and label_str.endswith(']'):
         inner = label_str[1:-1].strip()
         if inner == '':
@@ -71,7 +56,6 @@ def _parse_label_line(line, num_classes):
                 onehot[cid] = 1.0
         return fname, onehot
 
-    # ---------- 旧格式：one-hot ----------
     vals = label_str.split()
     if len(vals) != num_classes:
         return None
@@ -82,10 +66,6 @@ def _parse_label_line(line, num_classes):
     onehot = (onehot > 0.5).astype(np.float32)
     return fname, onehot
 
-
-# ============================================================
-# 数据源 1：磁盘 txt 标签文件
-# ============================================================
 class MultiLabelClassificationDataset(Dataset):
     def __init__(self, root, label_file, img_subdir, num_classes,
                  img_size=224,
@@ -123,13 +103,12 @@ class MultiLabelClassificationDataset(Dataset):
         self.epoch = 0
         self._label_id_to_name = {}
 
-        # ---------- 类名 ----------
         if class_names is not None:
             assert len(class_names) == self.num_classes, \
                 f'class_names 长度({len(class_names)}) != num_classes({self.num_classes})'
             self.class_names = list(class_names)
         else:
-            # 未提供类名时使用占位符，由调用方（trainer）负责解析真实类名
+
             self.class_names = [f'cls_{i}' for i in range(self.num_classes)]
 
         if not os.path.exists(self.img_dir):
@@ -137,7 +116,6 @@ class MultiLabelClassificationDataset(Dataset):
         if not os.path.exists(self.label_file):
             raise FileNotFoundError(f'标签文件不存在: {self.label_file}')
 
-        # ---------- 加载标签 ----------
         self.samples = []
         n_total_lines = 0
         n_mismatch = 0
@@ -161,7 +139,6 @@ class MultiLabelClassificationDataset(Dataset):
         print(f'[MultiLabelClsDataset] 标签文件共 {n_total_lines} 行，'
               f'解析有效 {len(self.samples)} 行')
 
-        # ---------- 预过滤不存在的图像 ----------
         if check_files:
             print(f'[MultiLabelClsDataset] 检查文件是否存在...')
             valid_samples = []
@@ -191,7 +168,6 @@ class MultiLabelClassificationDataset(Dataset):
         if len(self.samples) == 0:
             raise RuntimeError('过滤后无有效样本')
 
-        # ---------- 统计 ----------
         all_oh = np.stack([s[1] for s in self.samples], axis=0)
         n_empty = int((all_oh.sum(1) == 0).sum())
         pos_per_img = all_oh.sum(1).mean()
@@ -202,7 +178,6 @@ class MultiLabelClassificationDataset(Dataset):
               f'平均标签数/图={pos_per_img:.2f} | '
               f'空标签图={n_empty} | 零样本类={n_zero_class}')
 
-        # ---------- transform ----------
         norm = T.Normalize(mean=mean, std=std)
         if split == 'train':
             ops = []
@@ -234,7 +209,6 @@ class MultiLabelClassificationDataset(Dataset):
             self.debug_dir = os.path.join('./debug_vis', f'cls_{split}')
             os.makedirs(self.debug_dir, exist_ok=True)
 
-    # ------------------------------------------------------------------
     def set_epoch(self, epoch):
         self.epoch = epoch
 
@@ -288,10 +262,6 @@ class MultiLabelClassificationDataset(Dataset):
 
         return img_t, label_t
 
-
-# ============================================================
-# 数据源 HuggingFace datasets
-# ============================================================
 class HFMultiLabelClassificationDataset(Dataset):
     def __init__(self, hf_dataset,
                  num_classes=None,
@@ -362,7 +332,7 @@ class HFMultiLabelClassificationDataset(Dataset):
         else:
             self.label_mode = 'id_list'
             if num_classes is None:
-                # 优先从 label_names 扫描（同时拿到 id→name 映射）
+
                 id_to_name, max_id_names = self._scan_label_names_id_map()
                 if max_id_names >= 0:
                     self._label_id_to_name = id_to_name
@@ -377,7 +347,7 @@ class HFMultiLabelClassificationDataset(Dataset):
                           f'num_classes = {self.num_classes} (max_id={max_id})')
             else:
                 self.num_classes = int(num_classes)
-                # 用户指定 num_classes 也扫一下 label_names 供后续用
+
                 id_to_name, _ = self._scan_label_names_id_map()
                 self._label_id_to_name = id_to_name
 
@@ -446,7 +416,6 @@ class HFMultiLabelClassificationDataset(Dataset):
     def set_epoch(self, epoch):
         self.epoch = epoch
 
-    # ------------------------------------------------------------------
     def _scan_max_label_id(self):
         n = len(self.ds)
         max_samples = min(n, self.scan_max_samples)
@@ -472,20 +441,8 @@ class HFMultiLabelClassificationDataset(Dataset):
                     max_id = iv
         return max_id
 
-    # ------------------------------------------------------------------
     def _scan_label_names_id_map(self):
-        """
-        从数据集的 label_names 字段扫描构建 id → name 映射。
 
-        数据集中 labels 和 label_names 是索引对齐的：
-            labels       = [12, 45, 78]
-            label_names  = ['pizza', 'pasta', 'burger']
-        所以可以用 (id, name) 对构建完整映射。
-
-        返回:
-            id_to_name: dict[int, str]  id → 类名
-            max_id:     int              见过的最大 id（-1 表示没扫到）
-        """
         n = len(self.ds)
         max_samples = min(n, self.scan_max_samples)
         if n <= max_samples:
@@ -514,7 +471,6 @@ class HFMultiLabelClassificationDataset(Dataset):
                not isinstance(names, (list, tuple)):
                 continue
 
-            # labels 和 label_names 应该等长；不等长就跳过
             if len(labels) != len(names):
                 continue
 
@@ -529,9 +485,8 @@ class HFMultiLabelClassificationDataset(Dataset):
         max_id = max(id_to_name.keys()) if id_to_name else -1
         return id_to_name, max_id
 
-    # ------------------------------------------------------------------
     def _infer_class_names(self):
-        # ---------- 从 features 里直接读 ----------
+
         try:
             feat = self.ds.features.get('labels', None)
             if hasattr(feat, 'feature') and hasattr(feat.feature, 'names'):
@@ -549,7 +504,6 @@ class HFMultiLabelClassificationDataset(Dataset):
         except Exception:
             pass
 
-        # ---------- 从 label_names 字段扫描 ----------
         try:
             if getattr(self, '_label_id_to_name', None):
                 id_to_name = self._label_id_to_name
@@ -569,12 +523,10 @@ class HFMultiLabelClassificationDataset(Dataset):
         except Exception as e:
             print(f'[HFMultiLabelClsDataset] 扫描 label_names 失败: {e}')
 
-        # ---------- 占位兜底 ----------
         print(f'[HFMultiLabelClsDataset] 无法自动推断类名，'
               f'使用占位符 cls_0 ~ cls_{self.num_classes - 1}')
         return [f'cls_{i}' for i in range(self.num_classes)]
 
-    # ------------------------------------------------------------------
     def _parse_label(self, raw):
         if isinstance(raw, np.ndarray):
             raw = raw.tolist()

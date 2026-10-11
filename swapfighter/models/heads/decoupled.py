@@ -2,11 +2,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-
 class DecoupledBranch(nn.Module):
-    """
-    单任务分支：Conv3x3 → Norm → Act × num_convs → Conv1x1
-    """
     def __init__(self, in_channels, out_channels, num_convs=2,
                  norm_layer='group', act_layer='silu'):
         super().__init__()
@@ -59,14 +55,7 @@ class DecoupledBranch(nn.Module):
     def forward(self, x):
         return self.pred(self.tower(x))
 
-
 class DecoupledHead(nn.Module):
-    """
-    多任务容器：
-        neck_out → cls_branch → (B, num_classes, H, W)
-                 → reg_branch → (B, 4*(reg_max+1) 或 4, H, W)
-                 → angle_branch → (B, 2 或 1, H, W)  # 可选
-    """
     def __init__(self, in_channels, num_classes,
                  with_angle=False, angle_format='sin_cos',
                  num_convs=2, reg_max=16,
@@ -101,7 +90,7 @@ class DecoupledHead(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
-        # 分类：focal loss 先验
+
         cls_pred = self.cls_branch.pred
         nn.init.normal_(cls_pred.weight, std=0.01)
         if cls_pred.bias is not None:
@@ -109,7 +98,6 @@ class DecoupledHead(nn.Module):
                 prior_prob = 0.01
                 cls_pred.bias.fill_(-np.log((1 - prior_prob) / prior_prob))
 
-        # 回归：DFL 先验
         reg_pred = self.reg_branch.pred
         nn.init.normal_(reg_pred.weight, std=0.01)
         if reg_pred.bias is not None:
@@ -125,7 +113,6 @@ class DecoupledHead(nn.Module):
                     if reg_pred.bias.numel() >= 4:
                         reg_pred.bias[2:4].fill_(1.386)
 
-        # 角度：sin=0, cos=1
         if self.with_angle:
             angle_pred = self.angle_branch.pred
             nn.init.normal_(angle_pred.weight, std=0.005)

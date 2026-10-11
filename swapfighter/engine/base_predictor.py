@@ -1,6 +1,5 @@
 import torch
 
-
 class BasePredictor:
     def __init__(self, cfg_dict, weights=None):
         from ..cfg import Config

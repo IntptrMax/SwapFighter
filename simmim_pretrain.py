@@ -17,34 +17,16 @@ import timm
 from timm.layers import trunc_normal_
 from tqdm import tqdm
 
-
-# ============================================================
-# 工具函数
-# ============================================================
 def _ensure_rgb(img):
-    """确保图像为 RGB 模式。"""
     return img.convert('RGB') if img.mode != 'RGB' else img
 
-
 def _safe_call(owner, attr_name, x):
-    """
-    安全地调用 owner.<attr_name>(x)。
-
-    很多 timm 模型把"可选层"（patch_drop / norm_pre / bn1 / act1 ...）
-    设成 None，同时属性仍然存在。直接 hasattr 判断会通过，但调用会崩。
-    这里只有属性存在、非 None、且可调用时才真正执行。
-    """
     module = getattr(owner, attr_name, None)
     if module is not None and callable(module):
         return module(x)
     return x
 
-
-# ============================================================
-# 掩码生成器
-# ============================================================
 class MaskGenerator:
-    """随机块掩码生成器，输出像素级分辨率的 0/1 掩码。"""
 
     def __init__(self, input_size=224, mask_patch_size=32,
                  model_patch_size=4, mask_ratio=0.6):
@@ -72,14 +54,7 @@ class MaskGenerator:
                    .repeat(self.mask_patch_size, axis=1)
         return mask
 
-
-# ============================================================
-# 通用 Backbone for SimMIM
-# ============================================================
 class BackboneForSimMIM(nn.Module):
-    """
-    统一支持 Swin / ConvNeXt / ViT (含 Eva/DINOv3) / MobileNet 等 timm 模型。
-    """
 
     def __init__(self, backbone_name, img_size=224, mask_ratio=0.6,
                  mask_patch_size=32, pretrained=True):
@@ -98,7 +73,6 @@ class BackboneForSimMIM(nn.Module):
             self.is_mobilenet or self.is_efficientnet
         )
 
-        # ---- 创建模型 ----
         use_kwargs = dict(
             pretrained=pretrained,
             features_only=True,
@@ -112,18 +86,15 @@ class BackboneForSimMIM(nn.Module):
         except TypeError:
             self.encoder = timm.create_model(backbone_name, **use_kwargs)
 
-        # ---------- 自适应检测内层 backbone ----------
         self.inner = self._find_inner_backbone(self.encoder)
 
         self.img_size = img_size
         self.mask_ratio = mask_ratio
         self.mask_patch_size = mask_patch_size
 
-        # ---- embed_dim ----
         channels = self.encoder.feature_info.channels()
         self.embed_dim = channels[-1]
 
-        # ---- 推断 model patch size ----
         if self.is_swin:
             pe = self.inner.patch_embed
             ps = getattr(pe, 'patch_size', 4)
@@ -141,24 +112,20 @@ class BackboneForSimMIM(nn.Module):
         else:
             self.model_patch_size = 4
 
-        # ---- 最终下采样倍率 ----
         all_strides = [info['reduction'] for info in self.encoder.feature_info]
         self.final_downsample = all_strides[-1]
         assert img_size % self.final_downsample == 0, \
             f"img_size ({img_size}) 必须能被 final_downsample ({self.final_downsample}) 整除"
         self.final_res = img_size // self.final_downsample
 
-        # ---- 推断 stage1 通道数 ----
         self.stage1_dim = self._infer_stage1_dim()
 
-        # ---- mask token ----
         if self.is_swin:
             self.mask_token = nn.Parameter(torch.zeros(1, 1, 1, self.stage1_dim))
         else:
             self.mask_token = nn.Parameter(torch.zeros(1, self.stage1_dim, 1, 1))
         trunc_normal_(self.mask_token, mean=0., std=0.02)
 
-        # ---- 掩码生成器 ----
         self.mask_generator = MaskGenerator(
             input_size=img_size,
             mask_patch_size=mask_patch_size,
@@ -166,7 +133,6 @@ class BackboneForSimMIM(nn.Module):
             mask_ratio=mask_ratio,
         )
 
-        # ---- 线性解码器 ----
         patch_area = self.final_downsample ** 2 * 3
         self.decoder = nn.Linear(self.embed_dim, patch_area)
 
@@ -179,16 +145,8 @@ class BackboneForSimMIM(nn.Module):
         print(f"[SimMIM] stage1_dim = {self.stage1_dim}")
         print(f"[SimMIM] embed_dim = {self.embed_dim}")
 
-    # ------------------------------------------------------------------
     @staticmethod
     def _find_inner_backbone(encoder):
-        """
-        自适应检测 timm features_only=True 返回的实际 backbone 模块。
-
-        兼容：
-          - encoder 自身是 backbone（Swin / ConvNeXtFeatures / MobileNetV3Features）
-          - encoder 有 wrapper（model / body / backbone），例如 ViT / Eva
-        """
         print(f"[SimMIM] 检测内层 backbone...")
         print(f"[SimMIM]   encoder 直接子模块: "
               f"{[n for n, _ in encoder.named_children()]}")
@@ -234,9 +192,7 @@ class BackboneForSimMIM(nn.Module):
         print(f"[SimMIM]   使用 encoder 本身作为 backbone")
         return encoder
 
-    # ------------------------------------------------------------------
     def _infer_stage1_dim(self):
-        """推断 stage 1 输入的通道数。"""
         if self.is_swin:
             pe = self.inner.patch_embed
             if hasattr(pe, 'proj') and isinstance(pe.proj, nn.Conv2d):
@@ -282,7 +238,6 @@ class BackboneForSimMIM(nn.Module):
                     return m.out_channels
             return self.embed_dim
 
-    # ------------------------------------------------------------------
     def _downsample_mask_nhwc(self, mask, H, W):
         if mask.dim() == 4:
             mask = mask.squeeze(1)
@@ -291,7 +246,6 @@ class BackboneForSimMIM(nn.Module):
         ).squeeze(1)
         return (mask_down > 0.5).float()
 
-    # ------------------------------------------------------------------
     def _collect_swin_layers(self):
         inner = self.inner
         if hasattr(inner, 'layers'):
@@ -314,7 +268,6 @@ class BackboneForSimMIM(nn.Module):
             "既没有 inner.layers，也没有 inner.layers_0/1/2/..."
         )
 
-    # ------------------------------------------------------------------
     def _run_swin(self, x, mask):
         inner = self.inner
 
@@ -333,19 +286,9 @@ class BackboneForSimMIM(nn.Module):
         x = _safe_call(inner, 'norm', x)
         return x
 
-    # ------------------------------------------------------------------
     def _run_convnext(self, x, mask):
-        """
-        ConvNeXt: stem -> 注入 mask -> stages
-
-        兼容两种命名：
-            - 标准：inner.stem (Sequential) + inner.stages (Sequential)
-            - 拆分：inner.stem_0 + inner.stem_1 + inner.stages_0/1/2/3
-              （timm ConvNeXtFeatures 在 features_only=True 下的命名）
-        """
         inner = self.inner
 
-        # ---------- 1. stem ----------
         if hasattr(inner, 'stem'):
             x = inner.stem(x)
             x = _safe_call(inner, 'norm_pre', x)
@@ -361,11 +304,9 @@ class BackboneForSimMIM(nn.Module):
 
         B, C1, H, W = x.shape
 
-        # ---------- 2. 注入 mask ----------
         mask_down = self._downsample_mask_nhwc(mask, H, W).unsqueeze(1)
         x = x * (1 - mask_down) + self.mask_token * mask_down
 
-        # ---------- 3. stages ----------
         if hasattr(inner, 'stages'):
             x = inner.stages(x)
         elif hasattr(inner, 'stages_0'):
@@ -380,7 +321,6 @@ class BackboneForSimMIM(nn.Module):
 
         return x
 
-    # ------------------------------------------------------------------
     def _run_mobilenet(self, x, mask):
         inner = self.inner
 
@@ -401,11 +341,9 @@ class BackboneForSimMIM(nn.Module):
 
         return x
 
-    # ------------------------------------------------------------------
     def _run_efficientnet(self, x, mask):
         return self._run_mobilenet(x, mask)
 
-    # ------------------------------------------------------------------
     def _run_generic_cnn(self, x, mask):
         inner = self.inner
         stem_attr = None
@@ -438,36 +376,26 @@ class BackboneForSimMIM(nn.Module):
 
         return x
 
-    # ------------------------------------------------------------------
     def _run_vit(self, x, mask):
-        """
-        ViT / DINOv2 / DINOv3(Eva) 路径。
-
-        关键修改：
-          - patch_drop / norm_pre / norm 全部用 _safe_call，兼容 None
-          - pos_embed 优先用 inner._pos_embed（Eva/DINOv3 支持动态尺寸），
-            否则退化为手动加 pos_embed + cls_token
-        """
         inner = self.inner
 
-        # ---------- patch_embed ----------
         pe_out = inner.patch_embed(x)
 
         if pe_out.dim() == 3:
-            # NLC
+
             tokens = pe_out
             pe_layout = 'NLC'
             B, N, C1 = tokens.shape
             h = w = int(math.sqrt(N))
         elif pe_out.dim() == 4:
             if pe_out.shape[1] == self.stage1_dim:
-                # NCHW
+
                 B, C1, h, w = pe_out.shape
                 N = h * w
                 tokens = pe_out.flatten(2).transpose(1, 2)
                 pe_layout = 'NCHW'
             elif pe_out.shape[-1] == self.stage1_dim:
-                # NHWC
+
                 B, h, w, C1 = pe_out.shape
                 N = h * w
                 tokens = pe_out.reshape(B, N, C1)
@@ -482,19 +410,16 @@ class BackboneForSimMIM(nn.Module):
 
         assert N == h * w, f"token 数不匹配: N={N}, h*w={h*w}"
 
-        # ---------- 注入 mask ----------
         mask_down = self._downsample_mask_nhwc(mask, h, w).view(B, N, 1)
         mask_token_flat = self.mask_token.view(1, 1, C1)
         tokens = tokens * (1 - mask_down) + mask_token_flat * mask_down
 
-        # ---------- 位置编码 ----------
-        # 优先使用 _pos_embed（timm 新版 ViT / Eva 支持）
         pos_embed_fn = getattr(inner, '_pos_embed', None)
         if pos_embed_fn is not None and callable(pos_embed_fn):
-            # _pos_embed 期望 NLC 布局、不含 cls token
+
             tokens = pos_embed_fn(tokens)
         else:
-            # 退化路径：手动拼 cls_token + pos_embed
+
             cls_token = getattr(inner, 'cls_token', None)
             pos_embed = getattr(inner, 'pos_embed', None)
 
@@ -505,10 +430,10 @@ class BackboneForSimMIM(nn.Module):
             if pos_embed is not None:
                 pe = pos_embed
                 if pe.dim() == 3:
-                    # (1, N(+1), C)
+
                     tokens = tokens + pe
                 elif pe.dim() == 4:
-                    # (1, C, H, W) 或 (1, H, W, C)
+
                     if pe.shape[1] == C1:
                         pe = pe.flatten(2).transpose(1, 2)
                     else:
@@ -518,35 +443,28 @@ class BackboneForSimMIM(nn.Module):
                         pe = torch.cat([cls_pos, pe], dim=1)
                     tokens = tokens + pe
 
-        # ---------- patch_drop / norm_pre（可选层，可能为 None） ----------
         tokens = _safe_call(inner, 'patch_drop', tokens)
         tokens = _safe_call(inner, 'norm_pre', tokens)
 
-        # ---------- blocks ----------
         blocks = getattr(inner, 'blocks', None)
         if blocks is None:
             raise RuntimeError("ViT 无法找到 inner.blocks")
         for blk in blocks:
             tokens = blk(tokens)
 
-        # ---------- 最终 norm（可选） ----------
         tokens = _safe_call(inner, 'norm', tokens)
 
-        # ---------- 去掉 cls token（如果前面拼过） ----------
         cls_token = getattr(inner, 'cls_token', None)
         if cls_token is not None:
-            # 只有在没有走 _pos_embed 路径且确实拼了 cls_token 时才去
-            # 为避免误删，用 token 数判断：如果 tokens.shape[1] == N + 1
+
             if tokens.shape[1] == N + 1:
                 tokens = tokens[:, 1:, :]
 
-        # ---------- NLC -> NCHW ----------
         B, N_out, C_out = tokens.shape
         h = w = int(math.sqrt(N_out))
         tokens = tokens.transpose(1, 2).view(B, C_out, h, w)
         return tokens
 
-    # ------------------------------------------------------------------
     def _run_encoder(self, x, mask):
         if self.is_swin:
             return self._run_swin(x, mask)
@@ -561,7 +479,6 @@ class BackboneForSimMIM(nn.Module):
         else:
             return self._run_generic_cnn(x, mask)
 
-    # ------------------------------------------------------------------
     def forward(self, x, mask):
         features = self._run_encoder(x, mask)
 
@@ -598,12 +515,7 @@ class BackboneForSimMIM(nn.Module):
         loss = loss / num_masked
         return loss
 
-
-# ============================================================
-# 数据集
-# ============================================================
 class SimMIMDataset(Dataset):
-    """无标注图像数据集，返回 (image, mask)。"""
 
     def __init__(self, img_dir, img_size=224, mask_patch_size=32,
                  model_patch_size=4, mask_ratio=0.6):
@@ -642,10 +554,6 @@ class SimMIMDataset(Dataset):
         mask = torch.from_numpy(mask).float()
         return img, mask
 
-
-# ============================================================
-# 训练工具
-# ============================================================
 class AverageMeter:
     def __init__(self):
         self.reset()
@@ -662,7 +570,6 @@ class AverageMeter:
         self.count += n
         self.avg = self.sum / self.count
 
-
 def get_grad_norm(parameters, norm_type=2):
     if isinstance(parameters, torch.Tensor):
         parameters = [parameters]
@@ -673,10 +580,6 @@ def get_grad_norm(parameters, norm_type=2):
         total_norm += p.grad.data.norm(norm_type).item() ** norm_type
     return total_norm ** (1.0 / norm_type)
 
-
-# ============================================================
-# 参数解析
-# ============================================================
 def parse_args():
     parser = argparse.ArgumentParser('SimMIM 预训练脚本 (features_only=True 与 SWAP-Fighter 对齐)')
 
@@ -711,10 +614,6 @@ def parse_args():
 
     return parser.parse_args()
 
-
-# ============================================================
-# 主训练函数
-# ============================================================
 def main():
     args = parse_args()
 
@@ -726,7 +625,6 @@ def main():
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    # ---------- 精度 ----------
     use_amp = False
     amp_dtype = torch.float32
     scaler = None
@@ -752,7 +650,6 @@ def main():
     else:
         print("使用 FP32 全精度 (CPU)")
 
-    # ---------- 数据集 ----------
     print(f"加载数据集: {args.data_dir}")
     dataset = SimMIMDataset(
         img_dir=args.data_dir,
@@ -773,7 +670,6 @@ def main():
         persistent_workers=args.num_workers > 0,
     )
 
-    # ---------- 模型 ----------
     print(f"创建模型: {args.backbone} (pretrained={args.pretrained})")
     model = BackboneForSimMIM(
         backbone_name=args.backbone,
@@ -795,7 +691,6 @@ def main():
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"总参数: {total_params:,}, 可训练参数: {trainable_params:,}")
 
-    # ---------- 优化器 ----------
     no_decay = ['bias', 'norm', 'mask_token']
     optimizer_grouped_parameters = [
         {
@@ -811,7 +706,6 @@ def main():
     ]
     optimizer = AdamW(optimizer_grouped_parameters, lr=args.lr)
 
-    # ---------- LR scheduler ----------
     steps_per_epoch = max(len(dataloader) // args.accumulation_steps, 1)
     total_steps = steps_per_epoch * args.epochs
     warmup_steps = steps_per_epoch * args.warmup_epochs
@@ -824,7 +718,6 @@ def main():
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
-    # ---------- 训练循环 ----------
     print("=" * 60)
     print("开始 SimMIM 预训练 (features_only=True，与 SWAP-Fighter 对齐)")
     print(f"  骨干网络: {args.backbone}")
@@ -908,7 +801,6 @@ def main():
               f"平均损失: {loss_meter.avg:.6f} | "
               f"LR: {lr:.2e} | 耗时: {epoch_time:.1f}s")
 
-    # ---------- 保存最终编码器权重 ----------
     print("=" * 60)
     print("预训练完成，保存编码器权重...")
 
@@ -924,7 +816,6 @@ def main():
     print(f"编码器权重已保存至: {args.output}")
     print(f"该权重可直接被 SWAP-Fighter 的 Backbone 加载，无需任何归一化")
     print("=" * 60)
-
 
 if __name__ == '__main__':
     main()

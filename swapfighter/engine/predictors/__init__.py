@@ -1,3 +1,4 @@
 from .detect import DetectPredictor
 from .multilabel import MultiLabelPredictor
-__all__ = ['DetectPredictor', 'MultiLabelPredictor', 'ONNXPredictor']
+from .segment import SegPredictor
+__all__ = ['DetectPredictor', 'MultiLabelPredictor', 'ONNXPredictor', 'SegPredictor']
